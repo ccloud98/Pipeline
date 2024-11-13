@@ -13,7 +13,6 @@ import tqdm
 import time
 import torch
 from torch.utils.data import DataLoader
-import torch.autograd.profiler as profiler
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -69,7 +68,7 @@ if __name__ == "__main__":
             # 첫 번째 배치만 확인 후 break
             break
 
-        knnModel = MUSE(n_items=tr_params["n_items"], hidden_size=tr_params["hidden_size"], lr=tr_params["lr"], device=device)    
+        knnModel = MUSE(n_items=tr_params["n_items"], hidden_size=tr_params["hidden_size"], lr=tr_params["lr"], device=device) 
 
         epochs = tr_params.get("epochs", 10)
 
@@ -137,7 +136,7 @@ if __name__ == "__main__":
 
         # 예측값이 올바른 형태인지 확인
         if len(scores.shape) != 1:
-            print(f"Warning: scores expected to be 1-dimensional, but got shape {scores.shape}")
+            #print(f"Warning: scores expected to be 1-dimensional, but got shape {scores.shape}")
             # 다차원일 경우 1차원으로 변환
             scores = scores.flatten()
 
@@ -161,7 +160,3 @@ if __name__ == "__main__":
         # 결과를 .npy 파일로 저장
     np.save("resources/recos/MUSE.npy", recos_knn)
     print("Predictions saved to resources/MUSE.npy")
-
-
-
-
