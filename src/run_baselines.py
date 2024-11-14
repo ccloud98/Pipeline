@@ -9,6 +9,7 @@ from src.baselines.sknn import ContextKNN
 from src.baselines.vstan import VSKNN_STAN
 from src.baselines.stan import STAN
 from src.baselines.muse import MUSE 
+from src.baselines.larp import LARP
 import tqdm
 import time
 import torch
@@ -72,33 +73,36 @@ if __name__ == "__main__":
 
         epochs = tr_params.get("epochs", 10)
 
-    knnModel.model.train()
-    for epoch in range(epochs):
-        print(f"Epoch {epoch+1}/{epochs} 시작...")
-        epoch_loss = 0
-        for batch_idx, (inputs_padded, targets, len_str) in enumerate(train_dataloader):
-            knnModel.optimizer.zero_grad()
+        knnModel.model.train()
+        for epoch in range(epochs):
+            print(f"Epoch {epoch+1}/{epochs} 시작...")
+            epoch_loss = 0
+            for batch_idx, (inputs_padded, targets, len_str) in enumerate(train_dataloader):
+                knnModel.optimizer.zero_grad()
 
-            # 입력 데이터를 DataParallel이 GPU에 적절히 분산할 수 있도록 처리
-            inputs_padded = inputs_padded.to(device)
-            targets = targets.to(device)
-            len_str = len_str.to(device)
+                # 입력 데이터를 DataParallel이 GPU에 적절히 분산할 수 있도록 처리
+                inputs_padded = inputs_padded.to(device)
+                targets = targets.to(device)
+                len_str = len_str.to(device)
 
-            # 모델의 forward 메서드 호출, 두 개의 값을 반환 (hidden, preds)
-            hidden, preds = knnModel.model(inputs_padded, len_str)
+                # 모델의 forward 메서드 호출, 두 개의 값을 반환 (hidden, preds)
+                hidden, preds = knnModel.model(inputs_padded, len_str)
 
-            # 다중 타겟이 아니라 단일 타겟으로 변환
-            targets = torch.argmax(targets, dim=1)
+                # 다중 타겟이 아니라 단일 타겟으로 변환
+                targets = torch.argmax(targets, dim=1)
 
-            # 손실 계산 및 역전파
-            loss = knnModel.loss_func(preds, targets)
-            loss.backward()
-            knnModel.optimizer.step()
- 
-            epoch_loss += loss.item()
+                # 손실 계산 및 역전파
+                loss = knnModel.loss_func(preds, targets)
+                loss.backward()
+                knnModel.optimizer.step()
+    
+                epoch_loss += loss.item()
 
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_dataloader)}")
-
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_dataloader)}")                                                                                     
+    
+    if args.model_name == "LARP":
+        larpModel = LARP(k=tr_params["k"], sample_size=tr_params["n_sample"], embed_dim=tr_params.get("embed_dim", 256))
+        knnModel = larpModel
 
 
     last_item = df_train[df_train.SessionId.isin(data_manager.test_indices)].sort_values("Time", ascending=False).groupby("SessionId", as_index=False).first()
@@ -158,5 +162,6 @@ if __name__ == "__main__":
         # 최종적으로 500개의 값만 가지도록 저장
         recos_knn[i] = top_k_scores
         # 결과를 .npy 파일로 저장
-    np.save("resources/recos/MUSE.npy", recos_knn)
-    print("Predictions saved to resources/MUSE.npy")
+    save_path = f"resources/recos/{args.model_name}.npy"
+    np.save(save_path, recos_knn)
+    print(f"Predictions saved to {save_path}")

@@ -9,7 +9,8 @@ recos_paths = {
     'MF-GRU': 'resources/recos/MF-GRU.npy',
     'MF-AVG': 'resources/recos/MF-AVG.npy',
     'VSKNN': 'resources/recos/VSKNN.npy',
-    'MUSE' : 'resources/recos/MUSE.npy'
+    'MUSE' : 'resources/recos/MUSE.npy',
+    'LARP' : 'resources/recos/LARP.npy'
 }
 
 # 추천 결과 로드
