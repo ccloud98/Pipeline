@@ -6,17 +6,27 @@ from tqdm import tqdm
 
 
 class MUSE:
-    def __init__(self, n_items, hidden_size, lr, device):
+    def __init__(self, n_items=2252463, hidden_size=128, lr=0.001, device='cuda', k=1500, sample_size=2500, sampling='recent', similarity='cosine', weighting='div', extend=False, normalize=True, session_key='SessionId', item_key='ItemId', time_key='Time'):
         self.n_items = n_items
-        self.hidden_size = hidden_size
-        self.device = device
+        self.hidden_size = 128
+        self.device = 'cuda'
+        self.k = k
+        self.sample_size = sample_size
+        self.sampling = sampling
+        self.similarity = similarity
+        self.weighting = weighting
+        self.extend = extend
+        self.normalize = normalize
+        self.session_key = session_key
+        self.item_key = item_key
+        self.time_key = time_key
 
         # 모델을 DataParallel로 감싸서 여러 GPU를 사용할 수 있도록 설정
         self.model = VICReg(self.n_items, self.hidden_size, self.device)
 
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs")
-            self.model = nn.DataParallel(self.model)  # device_ids를 명시하지 않고 자동으로 사용
+            self.model = nn.DataParallel(self.model, device_ids=None)  # device_ids를 명시하지 않고 자동으로 사용
         self.model = self.model.to(self.device)  # 모델을 지정된 장치로 이동
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
@@ -35,7 +45,7 @@ class MUSE:
                 len_str = len_str.cuda()
                 targets = targets.cuda()
 
-                 # 모델의 forward 메서드 호출, 두 개의 값을 반환 (hidden, preds)
+                # 모델의 forward 메서드 호출, 두 개의 값을 반환 (hidden, preds)
                 hidden, preds = self.model(inputs_padded.to(self.device), len_str.to(self.device))
 
                 targets = targets.to(self.device)
@@ -44,7 +54,10 @@ class MUSE:
                 targets = torch.argmax(targets, dim=1)
 
                 # 손실 계산 및 역전파
-                loss = self.loss_func(preds, targets)
+                rec_loss = self.loss_func(preds, targets)
+                matching_loss = self.model.module.compute_finegrained_matching_loss({'orig_sess': inputs_padded}, hidden, hidden, preds, preds, epoch)
+                loss = 0.5 * rec_loss + 0.5 * matching_loss  # 각 손실 항목에 가중치를 적용하여 합산
+
                 loss.backward()
                 self.optimizer.step()
 
@@ -68,10 +81,7 @@ class MUSE:
 
     def calculate_loss(self, predictions, batch):
         # 아이템 임베딩을 활용한 예측 손실 계산
-        if isinstance(self.model, nn.DataParallel):
-            all_embs = self.model.module.backbone.item_embedding.weight
-        else:
-            all_embs = self.model.backbone.item_embedding.weight
+        all_embs = self.model.module.backbone.item_embedding.weight if isinstance(self.model, nn.DataParallel) else self.model.backbone.item_embedding.weight
         logits = torch.matmul(predictions, all_embs.transpose(0, 1))
         loss = self.loss_func(logits, batch['labels'])  # 타겟은 batch의 labels
         return loss
@@ -79,10 +89,7 @@ class MUSE:
 
     def predict(self, predictions):
         # 모델의 예측 확률을 계산하여 반환
-        if isinstance(self.model, nn.DataParallel):
-            all_embs = self.model.module.backbone.item_embedding.weight
-        else:
-            all_embs = self.model.backbone.item_embedding.weight
+        all_embs = self.model.module.backbone.item_embedding.weight if isinstance(self.model, nn.DataParallel) else self.model.backbone.item_embedding.weight
         logits = torch.matmul(predictions, all_embs.transpose(0, 1))
         logits = F.softmax(logits, dim=1)  # 소프트맥스 확률 계산
         return logits
@@ -111,31 +118,27 @@ class VICReg(nn.Module):
     def compute_finegrained_matching_loss(self, batch, seq_hidden1, seq_hidden2, seq_pred1, seq_pred2, epoch):
         loss = 0.0
         mask1 = batch['orig_sess'].gt(0)
-        mask2 = batch['aug1'].gt(0)
+        mask2 = batch['orig_sess'].gt(0)  # 일단 동일한 batch에서 가져오도록 수정
         mask = torch.cat([mask1.unsqueeze(0), mask2.unsqueeze(0)], dim=0)
 
         seq_hidden = torch.cat([seq_hidden1.unsqueeze(0),
                                 seq_hidden2.unsqueeze(0)], dim=0)
-        seq_pred = torch.cat([seq_pred1.unsqueeze(0), seg_pred2.unsqueeze(0)], dim=0)
+        seq_pred = torch.cat([seq_pred1.unsqueeze(0), seq_pred2.unsqueeze(0)], dim=0)
 
-        v1_position = torch.arange(self.args.maxlen).unsqueeze(0).repeat(
-            batch['position_labels'].size(0), 1)
-        v2_position = batch['position_labels'].masked_fill(
-            batch['position_labels'] < 0, 0)
+        v1_position = torch.arange(batch['orig_sess'].size(1)).unsqueeze(0).repeat(batch['orig_sess'].size(0), 1).to(self.backbone.device)
+        v2_position = batch['orig_sess'].masked_fill(batch['orig_sess'] < 0, 0).to(self.backbone.device)
         locations = torch.cat([v1_position.unsqueeze(0),
-                               v2_position.unsqueeze(0)], dim=0).to(self.device)
+                               v2_position.unsqueeze(0)], dim=0).to(self.backbone.device)
 
         # Global criterion
-        if self.args.alpha < 1.0:
+        if hasattr(self, 'args') and hasattr(self.args, 'alpha') and self.args.alpha < 1.0:
             inv_loss, var_loss, cov_loss = self.global_loss(seq_pred)
-            loss = loss + (1 - self.args.alpha) * (inv_loss + var_loss + cov_loss)
+            loss = loss + (1 - self.backbone.args.alpha) * (inv_loss + var_loss + cov_loss)
 
         # Local criterion
-        # Maps shape: B, C, H, W
-        # With convnext actual maps shape is: B, H * W, C
-        if self.args.alpha > 0.0:
+        if hasattr(self, 'args') and hasattr(self.args, 'alpha') and self.args.alpha > 0.0:
             (maps_inv_loss, maps_var_loss, maps_cov_loss) = self.finegrained_matching_loss(seq_hidden, locations, mask, epoch)
-            loss = loss + (self.args.alpha) * (
+            loss = loss + (self.backbone.args.alpha) * (
                 maps_inv_loss + maps_var_loss + maps_cov_loss
             )
         return loss
@@ -143,6 +146,44 @@ class VICReg(nn.Module):
         loss = 0.0
         # 추가적인 로직 필요 시 이곳에서 처리
 
+    def global_loss(self, seq_pred):
+        # Global criterion 손실 함수 정의
+        inv_loss = self._inv_loss(seq_pred[0], seq_pred[1], loss_type='mse')
+        var_loss, cov_loss = self._vicreg_loss(seq_pred[0], seq_pred[1])
+        return inv_loss, var_loss, cov_loss
+
+    def _inv_loss(self, x, y, loss_type='mse'):
+        if loss_type.lower() == 'mse':
+            repr_loss = F.mse_loss(x, y)
+        elif loss_type.lower() == 'infonce':
+            repr_logits, repr_labels = self.info_nce(x, y, temperature=0.5, batch_size=x.size(0))
+            repr_loss = F.cross_entropy(repr_logits, repr_labels)
+        else:
+            raise ValueError(f"Invalid loss type: {loss_type}")
+        return repr_loss
+
+    def _vicreg_loss(self, x, y):
+        # Variance와 Covariance 손실을 계산하는 함수
+        repr_loss = F.mse_loss(x, y)
+
+        x = x - x.mean(dim=0)
+        y = y - y.mean(dim=0)
+
+        std_x = torch.sqrt(x.var(dim=0) + 0.0001)
+        std_y = torch.sqrt(y.var(dim=0) + 0.0001)
+        std_loss = torch.mean(F.relu(1.0 - std_x)) / 2 + torch.mean(F.relu(1.0 - std_y)) / 2
+
+        cov_x = torch.matmul(x.T, x) / (x.size(0) - 1)
+        cov_y = torch.matmul(y.T, y) / (y.size(0) - 1)
+        cov_loss = (self.off_diagonal(cov_x).pow(2).sum() + self.off_diagonal(cov_y).pow(2).sum()) / 2
+
+        return std_loss, cov_loss
+
+    def off_diagonal(self, x):
+        # 대각선을 제외한 요소를 반환
+        n, m = x.shape
+        assert n == m
+        return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
 class SRGNN(nn.Module):
