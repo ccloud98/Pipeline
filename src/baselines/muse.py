@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 class MUSE:
-    def __init__(self, k=1500, n_items=2252463, hidden_size=128, lr=0.001, batch_size=64, alpha=0.5, inv_coeff=1.0, var_coeff=0.5, cov_coeff=0.25, n_layers=6, maxlen=50, dropout=0.1, embedding_dim=256, n_sample=10000, step=1):
+    def __init__(self, k=1500, n_items=2252463, hidden_size=128, lr=0.01, batch_size=64, alpha=0.5, inv_coeff=1.0, var_coeff=0.5, cov_coeff=0.25, n_layers=6, maxlen=50, dropout=0.1, embedding_dim=256, n_sample=1000, step=1):
         # 모델의 주요 파라미터 초기화
         self.k = k
         self.n_items = n_items
@@ -24,7 +24,14 @@ class MUSE:
         self.n_sample = n_sample
         self.step = step
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.load_model()
+        
+        # 모델을 DataParallel로 감싸서 여러 GPU를 사용할 수 있도록 설정
+        self.model = VICReg(self.n_items, self)
+
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            self.model = nn.DataParallel(self.model, device_ids=None)  # device_ids를 명시하지 않고 자동으로 사용
+        self.model = self.model.to(self.device)  # 모델을 지정된 장치로 이동
 
     def load_model(self):
         self.model = VICReg(self.n_items, self).to(self.device)
@@ -123,17 +130,14 @@ class MUSE:
                 self.optimizer.zero_grad()
 
                 # 입력 데이터를 DataParallel이 GPU에 적절히 분산할 수 있도록 처리
-                if torch.cuda.device_count() > 1:
-                    inputs_padded = nn.DataParallel(inputs_padded).cuda()
-                    len_str = nn.DataParallel(len_str).cuda()
-                    targets = nn.DataParallel(targets).cuda()
-                else:
-                    inputs_padded = inputs_padded.cuda()
-                    len_str = len_str.cuda()
-                    targets = targets.cuda()
+                inputs_padded = inputs_padded.cuda()
+                len_str = len_str.cuda()
+                targets = targets.cuda()
+
+                batch = {'orig_sess': inputs_padded, 'lens': len_str}
 
                 # 모델의 forward 메서드 호출, 두 개의 값을 반환 (hidden, preds)
-                hidden, preds = self.model(inputs_padded.to(self.device), len_str.to(self.device))
+                hidden, preds = self.model(batch, input_str='orig_sess', len_str='lens')
 
                 targets = targets.to(self.device)
 
@@ -141,9 +145,10 @@ class MUSE:
                 targets = torch.argmax(targets, dim=1)
 
                 # 손실 계산 및 역전파
+                targets = torch.argmax(targets, dim=1)
                 rec_loss = self.loss_func(preds, targets)
-                matching_loss = self.model.compute_finegrained_matching_loss({'orig_sess': inputs_padded}, hidden, hidden, preds, preds, epoch)
-                loss = self.alpha * rec_loss.mean() + (1 - self.alpha) * matching_loss  # 각 손실 항목에 가중치를 적용하여 합산
+                matching_loss = self.model.compute_finegrained_matching_loss(batch, hidden, hidden, preds, preds, epoch)
+                loss = self.alpha * rec_loss.mean() + (1 - self.alpha) * matching_loss
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # Gradient clipping 적용

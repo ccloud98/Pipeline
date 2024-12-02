@@ -54,6 +54,14 @@ if __name__ == "__main__":
                          alpha=tr_params["alpha"], inv_coeff=tr_params["inv_coeff"], var_coeff=tr_params["var_coeff"], cov_coeff=tr_params["cov_coeff"],
                          n_layers=tr_params["n_layers"], maxlen=tr_params["maxlen"], dropout=tr_params["dropout"],
                          embedding_dim=tr_params["embedding_dim"], n_sample=tr_params["n_sample"], step=tr_params["step"] )
+        
+        max_valid_index = data_manager.playlist_track.shape[0] - 1
+        indices = np.random.choice(range(max_valid_index + 1), size=tr_params["n_sample"], replace=False)
+        train_dataset = SequentialTrainDataset(data_manager, indices)
+        train_dataloader = DataLoader(train_dataset, batch_size=tr_params["batch_size"], shuffle=True, collate_fn=pad_collate)
+
+        knnModel.load_model()
+        knnModel.fit(train_dataloader, epochs=10)
 
     last_item = df_train[df_train.SessionId.isin(data_manager.test_indices)].sort_values("Time", ascending=False).groupby("SessionId", as_index=False).first()
     all_tids = np.arange(data_manager.n_tracks)

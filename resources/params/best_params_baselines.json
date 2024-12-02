@@ -2,8 +2,8 @@
  "SKNN": {"k": 1500, "n_sample": 2500, "s": "cosine"}, 
  "STAN": {"k": 1500, "n_sample": 2500, "sp_w": 16, "sn_w": 80, "in_w": 128},
  "VSTAN": {"k": 2000, "n_sample": 2500, "sp_w": 1e-05, "sn_w": 5, "in_w": 8},
- "MUSE": {"k": 1500, "n_items": 2252463, "hidden_size": 128, "lr": 0.001, "batch_size": 64, "alpha": 0.5, 
+ "MUSE": {"k": 1500, "n_items": 2252463, "hidden_size": 128, "lr": 0.01, "batch_size": 64, "alpha": 0.5, 
           "inv_coeff": 1.0, "var_coeff": 0.5, "cov_coeff": 0.25, "shuffle_key_idx": {"shuffle": 1, "nonshuffle": 0},
-          "n_layers": 6, "maxlen": 50, "dropout": 0.1, "embedding_dim": 256, "n_sample": 10000, "step": 1},
+          "n_layers": 6, "maxlen": 50, "dropout": 0.1, "embedding_dim": 256, "n_sample": 1000, "step": 1},
  "LARP": {"k": 1500, "n_sample": 2500, "embed_dim": 256, "queue_size": 57600, "momentum": 0.995, "epochs": 100}
 }

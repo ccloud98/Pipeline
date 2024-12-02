@@ -6,9 +6,9 @@ from src.data_manager.data_manager import DataManager
 # 추천 결과 파일 경로 설정
 recos_paths = {
     'MF-Transformer': 'resources/recos/MF-Transformer.npy',
-    'MF-GRU': 'resources/recos/MF-GRU.npy',
-    'MF-AVG': 'resources/recos/MF-AVG.npy',
-    'VSKNN': 'resources/recos/VSKNN.npy',
+    # 'MF-GRU': 'resources/recos/MF-GRU.npy',
+    # 'MF-AVG': 'resources/recos/MF-AVG.npy',
+    # 'VSKNN': 'resources/recos/VSKNN.npy',
     'MUSE' : 'resources/recos/MUSE.npy',
     'LARP' : 'resources/recos/LARP.npy'
 }
