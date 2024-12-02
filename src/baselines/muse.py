@@ -1,9 +1,9 @@
-import numpy as np
-from tqdm import tqdm
 import torch
-import torch.nn as nn
+import numpy as np
 import torch.nn.functional as F
-import torch.optim as optim
+from torch import nn, optim
+from tqdm import tqdm
+
 
 class MUSE:
     def __init__(self, k=1500, n_items=2252463, hidden_size=128, lr=0.01, batch_size=64, alpha=0.5, inv_coeff=1.0, var_coeff=0.5, cov_coeff=0.25, n_layers=6, maxlen=50, dropout=0.1, embedding_dim=256, n_sample=1000, step=1):
@@ -93,35 +93,18 @@ class MUSE:
 
         return loss
 
-    def predict(self, predictions):
-        all_embs = self.model.backbone.item_embedding.weight
-        logits = torch.matmul(predictions, all_embs.transpose(0, 1))
-        logits = F.softmax(logits, dim=1)
+        # 모델을 DataParallel로 감싸서 여러 GPU를 사용할 수 있도록 설정
+        self.model = VICReg(self.n_items, self.hidden_size, self.device)
 
-        return logits
-    
-    def predict_next(self, session_id, input_item_id, predict_for_item_ids):
-        self.model.eval()
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            self.model = nn.DataParallel(self.model, device_ids=None)  # device_ids를 명시하지 않고 자동으로 사용
+        self.model = self.model.to(self.device)  # 모델을 지정된 장치로 이동
 
-        # 입력 배치 준비
-        input_batch = self.prepare_input(session_id, input_item_id, predict_for_item_ids)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.loss_func = nn.CrossEntropyLoss(reduction='mean')  # 손실 계산 방식을 'mean'으로 변경
 
-        # 모델을 통한 예측
-        _, predictions = self.model(input_batch)
 
-        # logits 계산 후 소프트맥스 확률 반환
-        logits = self.predict(predictions)
-        return logits.detach().cpu().numpy()
-    
-    def prepare_input(self, session_id, input_item_id, predict_for_item_ids):
-        # 입력 데이터를 준비하는 메서드
-        input_batch = {
-            'orig_sess': torch.tensor([[input_item_id]]).to(self.device),  # 세션 내 아이템
-            'lens': torch.tensor([1]).to(self.device),  # 시퀀스 길이
-            'labels': torch.tensor(predict_for_item_ids).to(self.device)  # 예측할 아이템들
-        }
-        return input_batch
-    
     def fit(self, train_dataloader, epochs):
         self.model.train()
         for epoch in range(epochs):
@@ -151,227 +134,195 @@ class MUSE:
                 loss = self.alpha * rec_loss.mean() + (1 - self.alpha) * matching_loss
 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # Gradient clipping 적용
                 self.optimizer.step()
 
                 epoch_loss += loss.item()
 
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_dataloader)}")
+
+    @torch.no_grad()
+    def predict_next(self, session_id, input_item_id, predict_for_item_ids):
+        self.model.eval()
+
+        # 입력 배치 준비
+        input_batch = self.prepare_input(session_id, input_item_id, predict_for_item_ids)
+
+        # 모델을 통한 예측
+        _, predictions = self.model(input_batch['orig_sess'], input_batch['lens'])
+
+        # logits 계산 후 소프트맥스 확률 반환
+        logits = self.predict(predictions)
+        return logits.cpu().numpy()
+
+    def calculate_loss(self, predictions, batch):
+        # 아이템 임베딩을 활용한 예측 손실 계산
+        all_embs = self.model.module.backbone.item_embedding.weight if isinstance(self.model, nn.DataParallel) else self.model.backbone.item_embedding.weight
+        logits = torch.matmul(predictions, all_embs.transpose(0, 1))
+        loss = self.loss_func(logits, batch['labels'])  # 타겟은 batch의 labels
+        return loss
+
+
+    def predict(self, predictions):
+        # 모델의 예측 확률을 계산하여 반환
+        all_embs = self.model.module.backbone.item_embedding.weight if isinstance(self.model, nn.DataParallel) else self.model.backbone.item_embedding.weight
+        logits = torch.matmul(predictions, all_embs.transpose(0, 1))
+        logits = F.softmax(logits, dim=1)  # 소프트맥스 확률 계산
+        return logits
+
+
+    def prepare_input(self, session_id, input_item_id, predict_for_item_ids):
+        # 입력 데이터를 준비하는 메서드
+        input_batch = {
+            'orig_sess': torch.tensor([input_item_id]).unsqueeze(0).to(self.device),  # 세션 내 아이템
+            'lens': torch.tensor([1]).to(self.device),  # 시퀀스 길이
+            'labels': torch.tensor(predict_for_item_ids).to(self.device)  # 예측할 아이템들
+        }
+        return input_batch
+
+
 class VICReg(nn.Module):
-    def __init__(self, input_size, args):
+    def __init__(self, n_items, hidden_size, device):
         super().__init__()
-        self.n_items = input_size
-        self.args = args
-        self.device = args.device
-
-        self.num_features = args.hidden_size
-        self.backbone = SRGNN(input_size, args)
-
-        self.mask_default = self.mask_correlated_samples(batch_size=args.batch_size)
-
-    def forward(self, batch, input_str='orig_sess', len_str='lens', get_last=True):
-        if isinstance(batch, dict):
-            hidden, preds = self.backbone(batch, input_str, len_str, get_last)
-        else:
-            hidden, preds = self.backbone({'orig_sess': batch, 'lens': torch.tensor([batch.size(1)]).to(self.device)}, input_str, len_str, get_last)
+        self.backbone = SRGNN(n_items, hidden_size, device)
+    
+    def forward(self, batch, len_str):
+        # 배치에서 입력 시퀀스 및 길이 정보 추출
+        hidden, preds = self.backbone(batch, len_str)
         return hidden, preds
 
-    def compute_finegrained_matching_loss(self, batch,
-                                          seq_hidden1, seq_hidden2,
-                                          seq_pred1, seg_pred2, epoch):
+    def compute_finegrained_matching_loss(self, batch, seq_hidden1, seq_hidden2, seq_pred1, seq_pred2, epoch):
         loss = 0.0
         mask1 = batch['orig_sess'].gt(0)
-        mask2 = batch['aug1'].gt(0)
+        mask2 = batch['orig_sess'].gt(0)  # 일단 동일한 batch에서 가져오도록 수정
         mask = torch.cat([mask1.unsqueeze(0), mask2.unsqueeze(0)], dim=0)
 
         seq_hidden = torch.cat([seq_hidden1.unsqueeze(0),
                                 seq_hidden2.unsqueeze(0)], dim=0)
-        seq_pred = torch.cat([seq_pred1.unsqueeze(0), seg_pred2.unsqueeze(0)], dim=0)
+        seq_pred = torch.cat([seq_pred1.unsqueeze(0), seq_pred2.unsqueeze(0)], dim=0)
 
-        v1_position = torch.arange(self.args.maxlen).unsqueeze(0).repeat(
-            batch['labels'].size(0), 1).to(self.device)
-        v2_position = batch['labels'].masked_fill(
-            batch['labels'] < 0, 0).to(self.device)
+        v1_position = torch.arange(batch['orig_sess'].size(1)).unsqueeze(0).repeat(batch['orig_sess'].size(0), 1).to(self.backbone.device)
+        v2_position = batch['orig_sess'].masked_fill(batch['orig_sess'] < 0, 0).to(self.backbone.device)
         locations = torch.cat([v1_position.unsqueeze(0),
-                               v2_position.unsqueeze(0)], dim=0)
+                               v2_position.unsqueeze(0)], dim=0).to(self.backbone.device)
 
         # Global criterion
-        if self.args.alpha < 1.0:
+        if hasattr(self, 'args') and hasattr(self.args, 'alpha') and self.args.alpha < 1.0:
             inv_loss, var_loss, cov_loss = self.global_loss(seq_pred)
-            loss = loss + (1 - self.args.alpha) * (inv_loss + var_loss + cov_loss)
+            loss = loss + (1 - self.backbone.args.alpha) * (inv_loss + var_loss + cov_loss)
 
         # Local criterion
-        if self.args.alpha > 0.0:
+        if hasattr(self, 'args') and hasattr(self.args, 'alpha') and self.args.alpha > 0.0:
             (maps_inv_loss, maps_var_loss, maps_cov_loss) = self.finegrained_matching_loss(seq_hidden, locations, mask, epoch)
-            loss = loss + (self.args.alpha) * (
+            loss = loss + (self.backbone.args.alpha) * (
                 maps_inv_loss + maps_var_loss + maps_cov_loss
             )
-
         return loss
-    
-    def global_loss(self, embedding, maps=False):
-        num_views = len(embedding)
-        inv_loss = 0.0
-        iter_ = 0
-        for i in range(2):
-            for j in np.delete(np.arange(np.sum(num_views)), i):
-                inv_loss = inv_loss + F.mse_loss(embedding[i], embedding[j])
-                iter_ = iter_ + 1
-        inv_loss = self.args.inv_coeff * inv_loss / iter_
+        # 이 함수는 모델 학습에 사용됩니다.
+        loss = 0.0
+        # 추가적인 로직 필요 시 이곳에서 처리
 
-        var_loss = 0.0
-        cov_loss = 0.0
-        iter_ = 0
-        for i in range(num_views):
-            x = embedding[i]
-            x = x - x.mean(dim=0)
-            std_x = torch.sqrt(x.var(dim=0) + 0.0001)
-            var_loss = var_loss + torch.mean(torch.relu(1.0 - std_x))
-            cov_x = (x.T @ x) / (x.size(0) - 1)
-            cov_loss = cov_loss + self.off_diagonal(cov_x).pow_(2).sum().div(
-                self.args.hidden_size
-            )
-            iter_ = iter_ + 1
-        var_loss = self.args.var_coeff * var_loss / iter_
-        cov_loss = self.args.cov_coeff * cov_loss / iter_
-
+    def global_loss(self, seq_pred):
+        # Global criterion 손실 함수 정의
+        inv_loss = self._inv_loss(seq_pred[0], seq_pred[1], loss_type='mse')
+        var_loss, cov_loss = self._vicreg_loss(seq_pred[0], seq_pred[1])
         return inv_loss, var_loss, cov_loss
-    
+
+    def _inv_loss(self, x, y, loss_type='mse'):
+        if loss_type.lower() == 'mse':
+            repr_loss = F.mse_loss(x, y)
+        elif loss_type.lower() == 'infonce':
+            repr_logits, repr_labels = self.info_nce(x, y, temperature=0.5, batch_size=x.size(0))
+            repr_loss = F.cross_entropy(repr_logits, repr_labels)
+        else:
+            raise ValueError(f"Invalid loss type: {loss_type}")
+        return repr_loss
+
+    def _vicreg_loss(self, x, y):
+        # Variance와 Covariance 손실을 계산하는 함수
+        repr_loss = F.mse_loss(x, y)
+
+        x = x - x.mean(dim=0)
+        y = y - y.mean(dim=0)
+
+        std_x = torch.sqrt(x.var(dim=0) + 0.0001)
+        std_y = torch.sqrt(y.var(dim=0) + 0.0001)
+        std_loss = torch.mean(F.relu(1.0 - std_x)) / 2 + torch.mean(F.relu(1.0 - std_y)) / 2
+
+        cov_x = torch.matmul(x.T, x) / (x.size(0) - 1)
+        cov_y = torch.matmul(y.T, y) / (y.size(0) - 1)
+        cov_loss = (self.off_diagonal(cov_x).pow(2).sum() + self.off_diagonal(cov_y).pow(2).sum()) / 2
+
+        return std_loss, cov_loss
+
     def off_diagonal(self, x):
+        # 대각선을 제외한 요소를 반환
         n, m = x.shape
         assert n == m
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
-    def mask_correlated_samples(self, batch_size):
-        N = 2 * batch_size
-        mask = torch.ones((N, N), dtype=bool)
-        mask = mask.fill_diagonal_(0)
-        for i in range(batch_size):
-            mask[i, batch_size + i] = 0
-            mask[batch_size + i, i] = 0
-        return mask
 
 class SRGNN(nn.Module):
-    def __init__(self, input_size, args):
+    # SRGNN 구조 (간단화된 형태)
+    def __init__(self, n_items, hidden_size, device):
         super(SRGNN, self).__init__()
-        self.n_items = input_size
-        self.args = args
-        self.device = args.device
+        self.n_items = n_items
+        self.hidden_size = hidden_size
+        self.device = device
 
-        # Embedding
-        self.item_embedding = nn.Embedding(self.n_items, args.hidden_size, padding_idx=0)
+        self.item_embedding = nn.Embedding(self.n_items, self.hidden_size, padding_idx=0)
+        self.gnn = nn.GRU(self.hidden_size, self.hidden_size, batch_first=True)
 
-        # Model Architecture
-        self.gnn = GNN(args.hidden_size, step=args.n_layers)
-        self.linear1 = nn.Linear(args.hidden_size, args.hidden_size, bias=True)
-        self.linear2 = nn.Linear(args.hidden_size, args.hidden_size, bias=True)
-        self.linear3 = nn.Linear(args.hidden_size, args.hidden_size, bias=True)
-        self.linear_transform = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=True)
+    def forward(self, batch, len_str):
+        # item_seqs와 lengths 추출
+        item_seqs = batch
+        lengths = len_str
 
-        self._init_weights()
-    
-    def _init_weights(self):
-        stdv = 1.0 / np.sqrt(self.args.hidden_size)
-        for weight in self.parameters():
-            weight.data.uniform_(-stdv, stdv)
+        item_seqs = torch.clamp(item_seqs, min=0, max=self.n_items - 1)  # 범위를 0부터 n_items-1로 클램핑
 
-    def forward(self, batch, input_str='orig_sess', len_str='lens', get_last=True):
-        seqs = batch[input_str]
-        lengths_t = torch.as_tensor(batch[len_str]).to(self.device)
-        alias_inputs, A, items, mask = self._get_slice(seqs)
+        # item_seqs 인덱스 범위 출력 (디버깅용)
+        #print(f"item_seqs min: {item_seqs.min()}, item_seqs max: {item_seqs.max()}")
 
-        hidden = self.item_embedding(items)
-        hidden = self.gnn(A, hidden)
-        if alias_inputs.numel() > 0:
-            alias_inputs = alias_inputs.view(-1, alias_inputs.size(1), 1).expand(
-                -1, -1, self.args.hidden_size
-            )
-        else:
-            alias_inputs = torch.zeros(1, 1, self.args.hidden_size).to(self.device)
-        alias_inputs = alias_inputs.long()  # Ensure alias_inputs is of dtype int64
-        seq_hidden = torch.gather(hidden, dim=1, index=alias_inputs)
-        # fetch the last hidden state of last timestamp
-        ht = self.get_last_item(seq_hidden, lengths_t)
-        q1 = self.linear1(ht).view(ht.size(0), 1, ht.size(1))
-        q2 = self.linear2(seq_hidden)
+        # 인덱스 범위 검사
+        if item_seqs.max() >= self.n_items:
+            raise ValueError(f"item_seqs contains invalid index: {item_seqs.max()} >= {self.n_items}")
 
-        alp = self.linear3(torch.sigmoid(q1 + q2))
-        a = torch.sum(alp * seq_hidden * mask.view(mask.size(0), -1, 1).float(), 1)
-        seq_output = self.linear_transform(torch.cat([a, ht], dim=1))
+        # item_seqs를 임베딩
+        embeddings = self.item_embedding(item_seqs)
+
+        # lengths를 CPU 텐서로 변환
+        lengths_cpu = lengths.cpu()  # 이 부분에서 CUDA에서 CPU로 변환
+
+        # pack_padded_sequence 호출
+        packed_input = nn.utils.rnn.pack_padded_sequence(embeddings, lengths_cpu, batch_first=True, enforce_sorted=False)
         
-        return seq_hidden, seq_output
+        # GNN에 입력 전달
+        packed_output, _ = self.gnn(packed_input)
 
-    def _get_slice(self, seqs):
-        mask = seqs.gt(0)
-        items, A, alias_inputs = [], [], []
-        max_n_nodes = seqs.size(1)
-        seqs = seqs.cpu().numpy()
-        for seq in seqs:
-            node = np.unique(seq)
+        # 패딩 해제
+        output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
 
-            # 유효하지 않은 인덱스를 임베딩 범위 내로 조정
-            node = np.clip(node, 0, self.n_items - 1)
+        # 마지막 스텝의 예측 값 반환
+        last_step = lengths.view(-1, 1, 1).expand(output.size(0), 1, output.size(2)) - 1
+        last_output = output.gather(1, last_step).squeeze(1)
+        
+        return output, last_output
 
-            items.append(node.tolist() + (max_n_nodes - len(node)) * [0])
-            u_A = np.zeros((max_n_nodes, max_n_nodes))
-            for i in np.arange(len(seq) - 1):
-                if seq[i+1] == 0:
-                    break
-                u = np.where(node == seq[i])[0][0]
-                v = np.where(node == seq[i+1])[0][0]
-                u_A[u][v] = 1
-            u_sum_in = np.sum(u_A, 0)
-            u_sum_in[np.where(u_sum_in == 0)] = 1
-            u_A_in = np.divide(u_A, u_sum_in)
-            u_sum_out = np.sum(u_A, 1)
-            u_sum_out[np.where(u_sum_out == 0)] = 1
-            u_A_out = np.divide(u_A.transpose(), u_sum_out)
-            u_A = np.concatenate([u_A_in, u_A_out]).transpose()
-            A.append(u_A)
-            alias_inputs.append([np.where(node == i)[0][0] for i in seq if i in node])
-        alias_inputs = torch.LongTensor(alias_inputs).to(self.device)
-        A = torch.FloatTensor(np.array(A)).to(self.device)
-        items = torch.LongTensor(items).to(self.device)
 
-        return alias_inputs, A, items, mask
 
-    def get_last_item(self, seq_hidden, lengths_t):
-        idx = (lengths_t - 1).view(-1, 1).expand(len(lengths_t), seq_hidden.size(2)).unsqueeze(1)
-        return seq_hidden.gather(1, idx).squeeze(1)
+#  # 예시 사용법
+#  if __name__ == '__main__':
+#      device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#      n_items = 10000
+#      hidden_size = 100
+#      lr = 0.001
+#      muse = MUSE(n_items=n_items, hidden_size=hidden_size, lr=lr, device=device)
+    
+#      # 학습 예시 (train_dataloader는 미리 준비된 데이터 로더)
+#      # muse.fit(train_dataloader, epochs=10)
 
-class GNN(nn.Module):
-    """Gated GNN"""
-    def __init__(self, embedding_dim, step=1):
-        super(GNN, self).__init__()
-        self.step = step
-        self.hidden_size = embedding_dim
-        self.input_size = embedding_dim * 2
-        self.gate_size = 3 * embedding_dim
-        self.w_ih = nn.Parameter(torch.Tensor(self.gate_size, self.input_size))
-        self.w_hh = nn.Parameter(torch.Tensor(self.gate_size, self.hidden_size))
-        self.b_ih = nn.Parameter(torch.Tensor(self.gate_size))
-        self.b_hh = nn.Parameter(torch.Tensor(self.gate_size))
-        self.b_iah = nn.Parameter(torch.Tensor(self.hidden_size))
-        self.b_oah = nn.Parameter(torch.Tensor(self.hidden_size))
-
-        self.linear_edge_in = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.linear_edge_f = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-
-    def GNNCell(self, A, hidden):
-        input_in = torch.matmul(A[:, :, :A.shape[1]], self.linear_edge_in(hidden)) + self.b_iah
-        input_out = torch.matmul(A[:, :, A.shape[1]: 2 * A.shape[1]], self.linear_edge_out(hidden)) + self.b_oah
-        inputs = torch.cat([input_in, input_out], 2)
-        gi = F.linear(inputs, self.w_ih, self.b_ih)
-        gh = F.linear(hidden, self.w_hh, self.b_hh)
-        i_r, i_i, i_n = gi.chunk(3, 2)
-        h_r, h_i, h_n = gh.chunk(3, 2)
-        resetgate = torch.sigmoid(i_r + h_r)
-        inputgate = torch.sigmoid(i_i + h_i)
-        newgate = torch.tanh(i_n + resetgate * h_n)
-        hy = newgate + inputgate * (hidden - newgate)
-        return hy
-
-    def forward(self, A, hidden):
-        for i in range(self.step):
-            hidden = self.GNNCell(A, hidden)
-        return hidden
+#      # 예측 예시
+#      session_id = 1
+#      input_item_id = 123
+#      predict_for_item_ids = [111, 222, 333]
+#      predictions = muse.predict_next(session_id, input_item_id, predict_for_item_ids)
+#      print(predictions)
