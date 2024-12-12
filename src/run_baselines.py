@@ -43,62 +43,7 @@ if __name__ == "__main__":
         knnModel = VSKNN_STAN(k=tr_params["k"], sample_size=tr_params["n_sample"], lambda_spw=tr_params["sp_w"],  lambda_snh=tr_params["sn_w"], lambda_inh=tr_params["in_w"])
 
     if args.model_name == "STAN":
-        knnModel = STAN(k=tr_params["k"], sample_size=tr_params["n_sample"], lambda_spw=tr_params["sp_w"],  lambda_snh=tr_params["sn_w"], lambda_inh=tr_params["in_w"])
-
-    if args.model_name == "MUSE":
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # DataLoader 준비 (SequentialTrainDataset을 사용하여 데이터를 준비)
-        sample_size = 10000
-        train_dataset = SequentialTrainDataset(data_manager, data_manager.train_indices, sample_size=sample_size)
-        train_dataloader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=pad_collate, pin_memory=True) 
-        
-
-        # 데이터 로더 동작 검증 코드 추가
-        print("데이터 로더 동작을 검증합니다. 첫 번째 배치를 가져옵니다...")
-        for batch_idx, (inputs_padded, targets, len_str) in enumerate(train_dataloader):
-            # GPU로 데이터 이동
-            inputs_padded = inputs_padded.to(device)
-            targets = targets.to(device)
-            len_str = len_str.to(device)
-
-            print(f"배치 {batch_idx + 1} 확인:")
-            print(f"inputs_padded: {inputs_padded.shape}, device: {inputs_padded.device}")
-            print(f"targets: {targets.shape}, device: {targets.device}")
-            print(f"len_str: {len_str.shape}, device: {len_str.device}")
-            # 첫 번째 배치만 확인 후 break
-            break
-
-        knnModel = MUSE(n_items=tr_params["n_items"], hidden_size=tr_params["hidden_size"], lr=tr_params["lr"], device=device) 
-
-        epochs = tr_params.get("epochs", 10)
-
-        knnModel.model.train()
-        for epoch in range(epochs):
-            print(f"Epoch {epoch+1}/{epochs} 시작...")
-            epoch_loss = 0
-            for batch_idx, (inputs_padded, targets, len_str) in enumerate(train_dataloader):
-                knnModel.optimizer.zero_grad()
-
-                # 입력 데이터를 DataParallel이 GPU에 적절히 분산할 수 있도록 처리
-                inputs_padded = inputs_padded.to(device)
-                targets = targets.to(device)
-                len_str = len_str.to(device)
-
-                # 모델의 forward 메서드 호출, 두 개의 값을 반환 (hidden, preds)
-                hidden, preds = knnModel.model(inputs_padded, len_str)
-
-                # 다중 타겟이 아니라 단일 타겟으로 변환
-                targets = torch.argmax(targets, dim=1)
-
-                # 손실 계산 및 역전파
-                loss = knnModel.loss_func(preds, targets)
-                loss.backward()
-                knnModel.optimizer.step()
-    
-                epoch_loss += loss.item()
-
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(train_dataloader)}")                                                                                     
+        knnModel = STAN(k=tr_params["k"], sample_size=tr_params["n_sample"], lambda_spw=tr_params["sp_w"],  lambda_snh=tr_params["sn_w"], lambda_inh=tr_params["in_w"])                                                                                     
     
     if args.model_name == "LARP":
         larpModel = LARP(k=tr_params["k"], sample_size=tr_params["n_sample"], embed_dim=tr_params.get("embed_dim", 256))
@@ -109,14 +54,6 @@ if __name__ == "__main__":
                          alpha=tr_params["alpha"], inv_coeff=tr_params["inv_coeff"], var_coeff=tr_params["var_coeff"], cov_coeff=tr_params["cov_coeff"],
                          n_layers=tr_params["n_layers"], maxlen=tr_params["maxlen"], dropout=tr_params["dropout"],
                          embedding_dim=tr_params["embedding_dim"], n_sample=tr_params["n_sample"], step=tr_params["step"] )
-        
-        max_valid_index = data_manager.playlist_track.shape[0] - 1
-        indices = np.random.choice(range(max_valid_index + 1), size=tr_params["n_sample"], replace=False)
-        train_dataset = SequentialTrainDataset(data_manager, indices)
-        train_dataloader = DataLoader(train_dataset, batch_size=tr_params["batch_size"], shuffle=True, collate_fn=pad_collate)
-
-        knnModel.load_model()
-        knnModel.fit(train_dataloader, epochs=10)
 
     last_item = df_train[df_train.SessionId.isin(data_manager.test_indices)].sort_values("Time", ascending=False).groupby("SessionId", as_index=False).first()
     all_tids = np.arange(data_manager.n_tracks)
@@ -130,18 +67,12 @@ if __name__ == "__main__":
     test_to_last = array_mapping(data_manager.test_indices, last_item.SessionId.values)
 
     start_fit = time.time()
-    print("Start fitting knn model")
-    if args.model_name == "MUSE":
-        epochs = 10
-        knnModel.fit(train_dataloader, epochs)  # DataLoader로 학습
-
-    else:
-        knnModel.fit(df_train)
+    print("Start fitting" , args.model_name , "model")
     end_fit = time.time()
     print("Training done in %.2f seconds" % (end_fit - start_fit))
 
     # Start predicting knn model
-    print("Start predicting knn model")
+    print("Start predicting" , args.model_name , "model")
     recos_knn = np.zeros((10000, 500))
 
     for i, (pid, tid, t) in tqdm.tqdm(enumerate(last_item[["SessionId", "ItemId", "Time"]].values)):
