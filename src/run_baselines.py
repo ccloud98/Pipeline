@@ -10,6 +10,7 @@ from src.baselines.vstan import VSKNN_STAN
 from src.baselines.stan import STAN
 from src.baselines.muse import MUSE 
 from src.baselines.larp import LARP
+from src.baselines.pisa import PISA
 import tqdm
 import time
 import torch
@@ -54,6 +55,13 @@ if __name__ == "__main__":
                          alpha=tr_params["alpha"], inv_coeff=tr_params["inv_coeff"], var_coeff=tr_params["var_coeff"], cov_coeff=tr_params["cov_coeff"],
                          n_layers=tr_params["n_layers"], maxlen=tr_params["maxlen"], dropout=tr_params["dropout"],
                          embedding_dim=tr_params["embedding_dim"], n_sample=tr_params["n_sample"], step=tr_params["step"] )
+        
+    if args.model_name == "PISA":
+        pisaModel = PISA(
+            k=tr_params["k"], sample_size=tr_params["n_sample"], embed_dim=tr_params.get("embed_dim", 256), queue_size=tr_params.get("queue_size", 57600), 
+            momentum=tr_params.get("momentum", 0.995), session_key=tr_params.get("session_key", "SessionId"), item_key=tr_params.get("item_key", "ItemId"), time_key=tr_params.get("time_key", "Time")
+        )
+        knnModel = pisaModel
 
     last_item = df_train[df_train.SessionId.isin(data_manager.test_indices)].sort_values("Time", ascending=False).groupby("SessionId", as_index=False).first()
     all_tids = np.arange(data_manager.n_tracks)

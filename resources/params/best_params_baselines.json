@@ -5,5 +5,6 @@
  "MUSE": {"k": 1500, "n_items": 2252463, "hidden_size": 128, "lr": 0.005, "batch_size": 128, "alpha": 0.5, 
           "inv_coeff": 1.0, "var_coeff": 0.5, "cov_coeff": 0.25, "n_layers": 1, "maxlen": 50, "dropout": 0.2, 
           "embedding_dim": 256, "n_sample": 5000, "step": 1, "epochs": 10},
- "LARP": {"k": 1500, "n_sample": 2500, "embed_dim": 256, "queue_size": 57600, "momentum": 0.995, "epochs": 100}
+ "LARP": {"k": 1500, "n_sample": 2500, "embed_dim": 256, "queue_size": 57600, "momentum": 0.995, "epochs": 100},
+ "PISA": {"k": 1500, "n_sample": 1000, "sampling": "recent", "embed_dim": 256, "queue_size": 57600, "momentum": 0.995, "session_key": "SessionId", "item_key": "ItemId", "time_key": "Time"}
 }
