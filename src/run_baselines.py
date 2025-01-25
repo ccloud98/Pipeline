@@ -51,12 +51,19 @@ if __name__ == "__main__":
         knnModel = STAN(k=tr_params["k"], sample_size=tr_params["n_sample"], lambda_spw=tr_params["sp_w"],  lambda_snh=tr_params["sn_w"], lambda_inh=tr_params["in_w"])
 
     if args.model_name == "MUSE":
+<<<<<<< HEAD
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # DataLoader 준비 (SequentialTrainDataset을 사용하여 데이터를 준비)
         sample_size = 10000
         train_dataset = SequentialTrainDataset(data_manager, data_manager.train_indices, sample_size=sample_size)
         train_dataloader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=pad_collate, pin_memory=True) 
+=======
+        knnModel = MUSE( data_manager, k=tr_params["k"], n_items=tr_params["n_items"], hidden_size=tr_params["hidden_size"], lr=tr_params["lr"], batch_size=tr_params["batch_size"], 
+                         alpha=tr_params["alpha"], inv_coeff=tr_params["inv_coeff"], var_coeff=tr_params["var_coeff"], cov_coeff=tr_params["cov_coeff"],
+                         n_layers=tr_params["n_layers"], maxlen=tr_params["maxlen"], dropout=tr_params["dropout"],
+                         embedding_dim=tr_params["embedding_dim"], n_sample=tr_params["n_sample"], step=tr_params["step"] )
+>>>>>>> 30bbd26... PISA_v2
         
 
         # 데이터 로더 동작 검증 코드 추가
@@ -119,6 +126,7 @@ if __name__ == "__main__":
     test_to_last = array_mapping(data_manager.test_indices, last_item.SessionId.values)
 
     start_fit = time.time()
+<<<<<<< HEAD
     print("Start fitting knn model")
     if args.model_name == "MUSE":
         epochs = 10
@@ -126,6 +134,10 @@ if __name__ == "__main__":
 
     else:
         knnModel.fit(df_train)
+=======
+    print("Start fitting" , args.model_name , "model")
+    knnModel.run_training(train=df_train, tuning=False, savePath=savePath)
+>>>>>>> 30bbd26... PISA_v2
     end_fit = time.time()
     print("Training done in %.2f seconds" % (end_fit - start_fit))
 
@@ -164,9 +176,16 @@ if __name__ == "__main__":
         # 최종적으로 500개의 값만 가지도록 저장
         recos_knn[i] = top_k_scores
         # 결과를 .npy 파일로 저장
+<<<<<<< HEAD
     np.save("resources/recos/MUSE.npy", recos_knn)
     print("Predictions saved to resources/MUSE.npy")
 
 
 
 
+=======
+    
+    save_path = f"resources/recos/{args.model_name}.npy"
+    np.save(save_path, recos_knn)
+    print(f"Predictions saved to {save_path}")
+>>>>>>> 30bbd26... PISA_v2

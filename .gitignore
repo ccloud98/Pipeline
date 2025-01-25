@@ -3,4 +3,6 @@ spotify_million_playlist_dataset/
 resources/extended_recos/
 resources/recos/
 resources/models/
+__pycache__/
+*.pyc
 *.json
