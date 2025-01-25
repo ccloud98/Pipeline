@@ -24,6 +24,8 @@ if __name__ == "__main__":
                     help = "path to data", default="resources/data/baselines")
     parser.add_argument("--params_file", type = str, required = False,
                     help = "file for parameters", default="resources/params/best_params_baselines.json")
+    parser.add_argument("--models_path", type = str, required = False,
+                    help = "Path to save models", default = "resources/recos")
     args = parser.parse_args()
     with open(args.params_file, "r") as f:
       p = json.load(f)
@@ -33,6 +35,9 @@ if __name__ == "__main__":
     data_manager = DataManager()
 
     df_train = pd.read_hdf("%s/df_train_for_test" % args.data_path)
+    
+    savePath = "%s/%s" % (args.models_path, args.model_name)
+
     if args.model_name == "VSKNN":
         knnModel = VMContextKNN(k=tr_params["k"], sample_size=tr_params["n_sample"], weighting=tr_params["w"], weighting_score=tr_params["w_score"],  idf_weighting=tr_params["idf_w"])
 
@@ -51,7 +56,7 @@ if __name__ == "__main__":
         knnModel = larpModel
 
     if args.model_name == "MUSE":
-        knnModel = MUSE( k=tr_params["k"], n_items=tr_params["n_items"], hidden_size=tr_params["hidden_size"], lr=tr_params["lr"], batch_size=tr_params["batch_size"], 
+        knnModel = MUSE( data_manager, k=tr_params["k"], n_items=tr_params["n_items"], hidden_size=tr_params["hidden_size"], lr=tr_params["lr"], batch_size=tr_params["batch_size"], 
                          alpha=tr_params["alpha"], inv_coeff=tr_params["inv_coeff"], var_coeff=tr_params["var_coeff"], cov_coeff=tr_params["cov_coeff"],
                          n_layers=tr_params["n_layers"], maxlen=tr_params["maxlen"], dropout=tr_params["dropout"],
                          embedding_dim=tr_params["embedding_dim"], n_sample=tr_params["n_sample"], step=tr_params["step"] )
@@ -76,6 +81,7 @@ if __name__ == "__main__":
 
     start_fit = time.time()
     print("Start fitting" , args.model_name , "model")
+    knnModel.run_training(train=df_train, tuning=False, savePath=savePath)
     end_fit = time.time()
     print("Training done in %.2f seconds" % (end_fit - start_fit))
 
@@ -114,6 +120,7 @@ if __name__ == "__main__":
         # 최종적으로 500개의 값만 가지도록 저장
         recos_knn[i] = top_k_scores
         # 결과를 .npy 파일로 저장
+    
     save_path = f"resources/recos/{args.model_name}.npy"
     np.save(save_path, recos_knn)
     print(f"Predictions saved to {save_path}")

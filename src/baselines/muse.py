@@ -4,10 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from src.data_manager.data_manager import SequentialTrainDataset, pad_collate
+from torch.utils.data import DataLoader
+import time
+from src.rta.utils import padded_avg, get_device
 
-class MUSE:
-    def __init__(self, k=1500, n_items=2252463, hidden_size=128, lr=0.001, batch_size=64, alpha=0.5, inv_coeff=1.0, var_coeff=0.5, cov_coeff=0.25, n_layers=1, maxlen=50, dropout=0.1, embedding_dim=256, n_sample=10000, step=1):
-        # 모델의 주요 파라미터 초기화
+class MUSE(nn.Module):
+    def __init__(self,data_manager,training_params = {}, k=1500, n_items=2252463, hidden_size=128, lr=0.001, batch_size=64, alpha=0.5, inv_coeff=1.0, var_coeff=0.5, cov_coeff=0.25, n_layers=1, maxlen=50, dropout=0.1, embedding_dim=256, n_sample=10000, step=1):
+        super(MUSE, self).__init__()
         self.k = k
         self.n_items = n_items
         self.hidden_size = hidden_size
@@ -23,13 +27,130 @@ class MUSE:
         self.embedding_dim = embedding_dim
         self.n_sample = n_sample
         self.step = step
+        self.data_manager = data_manager
+        self.training_params = training_params
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.training_params = {
+            'lr': lr,                  # Learning rate
+            'wd': 1e-4,                # Weight decay (L2 regularization)
+            'mom': 0.9,                # Momentum for optimizer
+            'nesterov': True,          # Whether to use Nesterov momentum
+            'n_epochs': 50,            # Number of epochs
+            'clip': 1.0,               # Gradient clipping max norm
+            'patience': 5,             # For learning rate scheduler
+            'factor': 0.5,             # Learning rate decay factor
+            'max_size': 10000,         # Maximum size of the dataset
+            'n_neg': 5,                # Number of negative samples
+            'batch_size': batch_size   # Batch size
+        }
+
         self.load_model()
 
     def load_model(self):
         self.model = VICReg(self.n_items, self).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         self.loss_func = nn.CrossEntropyLoss(reduction='none')
+
+    def run_training(self, tuning=False, savePath=False):
+        # Test 데이터 로딩
+        if tuning:
+            test_evaluator, test_dataloader = self.data_manager.get_test_data("val")
+        else:
+            test_evaluator, test_dataloader = self.data_manager.get_test_data("test")
+        
+        # Optimizer, scheduler 및 train 데이터 준비
+        optimizer, scheduler, train_dataloader = self.prepare_training_objects(tuning)
+        
+        batch_ct = 0
+        print_every = False
+        if "step_every" in self.training_params.keys():
+            print_every = True
+        
+        start = time.time()
+        
+        # 모델 저장 경로가 제공되면 모델을 저장
+        if savePath:
+            torch.save(self, savePath)
+        
+        # 학습 시작
+        for epoch in range(self.training_params['n_epochs']):
+            print("Epoch %d/%d" % (epoch + 1, self.training_params['n_epochs']))
+            print("Elapsed time : %.0f seconds" % (time.time() - start))
+            
+            epoch_loss = 0  # 에포크 손실 초기화
+            
+            for xx_pad, yy_pad_neg, x_lens in tqdm(train_dataloader):
+                optimizer.zero_grad()
+                
+                # 배치 손실 계산
+                loss = self.compute_loss_batch(xx_pad.to(get_device()), yy_pad_neg.to(get_device()))
+                loss.backward()
+                
+                if self.training_params['clip']:
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.training_params['clip'], norm_type=2)
+                
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                
+                if print_every:
+                    if batch_ct % self.training_params["step_every"] == 0:
+                        scheduler.step()
+                        print(f"Batch {batch_ct}, Loss: {loss.item():.4f}")
+                        
+                        # 검증 지표 계산
+                        recos = self.compute_recos(test_dataloader)
+                        r_prec = test_evaluator.compute_all_R_precisions(recos)
+                        ndcg = test_evaluator.compute_all_ndcgs(recos)
+                        click = test_evaluator.compute_all_clicks(recos)
+                        
+                        print(f"rprec: {r_prec.mean():.3f}, ndcg: {ndcg.mean():.3f}, click: {click.mean():.3f}")
+                
+                batch_ct += 1
+            # 에포크 손실 출력
+            avg_epoch_loss = epoch_loss / len(train_dataloader)
+            print(f"Epoch {epoch + 1} Loss: {avg_epoch_loss:.4f}")
+            
+            # 모델 저장
+            if savePath:
+                torch.save(self, savePath)
+        
+        return
+    
+    def prepare_training_objects(self, tuning=False):
+        # Prepare the optimizer, the scheduler and the data_loader that will be used for training
+        optimizer = torch.optim.SGD(self.parameters(), lr= self.training_params['lr'], weight_decay=self.training_params['wd'], momentum=self.training_params['mom'], nesterov=self.training_params['nesterov'])
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, self.training_params['patience'], gamma=self.training_params['factor'], last_epoch=- 1, verbose=False)
+        if tuning:
+            train_indices = self.data_manager.train_indices
+        else:
+            train_indices = np.concatenate((self.data_manager.train_indices, self.data_manager.val_indices))
+        train_dataset = SequentialTrainDataset(self.data_manager, train_indices, max_size=self.training_params['max_size'], n_neg=self.training_params['n_neg'])
+        train_dataloader = DataLoader(train_dataset, batch_size = self.training_params['batch_size'], shuffle=True, collate_fn=pad_collate, num_workers=0)
+        return optimizer, scheduler, train_dataloader
+    
+    def compute_pos_loss_batch(self, X_agg, Y_pos_rep, pad_mask):
+        # The part of the loss that concerns positive examples
+        pos_prod = torch.sum(X_agg * Y_pos_rep, axis = 2).unsqueeze(2)
+        pos_loss = padded_avg(-F.logsigmoid(pos_prod), ~pad_mask).mean()
+        return pos_loss
+    
+    def compute_loss_batch(self, x_pos, x_neg):
+        # 패딩 마스크 생성 (0인 위치가 패딩)
+        pad_mask = (x_pos == 0).to(self.device)
+        
+        # 입력과 타겟 시퀀스 분리
+        input_rep = x_pos[:, :-1]  # 마지막 요소 제외
+        Y_pos_rep = x_pos[:, 1:]   # 첫 요소 제외
+        
+        # Positive 손실 계산
+        pos_loss = self.calculate_loss(input_rep, Y_pos_rep)
+        
+        # Negative 손실 계산 (패딩 마스크 조정)
+        neg_loss = self.calculate_neg_loss(input_rep, x_neg, pad_mask[:, :-1])
+        
+        return pos_loss + neg_loss
 
     def calculate_session_similarity(self, current_session, neighbor_sessions, method='cosine'):
         similarities = {}
@@ -117,12 +238,65 @@ class MUSE:
         avg_epoch_loss = epoch_loss / len(dataloader)
         return avg_epoch_loss
     
-    def calculate_loss(self, predictions, batch):
-        all_embs = self.model.backbone.item_embedding.weight
-        logits = torch.matmul(predictions, all_embs.transpose(0, 1))
-        loss = self.loss_func(logits, batch['labels'])
+    def calculate_loss(self, input_rep, Y_pos_rep):
+        # Ensure input_rep and Y_pos_rep are 2D (Batch, Features)
+        if len(input_rep.shape) == 3:
+            input_rep = input_rep.view(-1, input_rep.size(-1))
+            Y_pos_rep = Y_pos_rep.view(-1, Y_pos_rep.size(-1))
+
+        input_rep = input_rep.float()
+        Y_pos_rep = Y_pos_rep.float()
+
+        # Calculate logits
+        logits = torch.matmul(input_rep, Y_pos_rep.transpose(0, 1))
+
+        # Create target indices for each row (diagonal matrix indices)
+        target = torch.arange(logits.size(0), device=logits.device)
+
+        # Calculate loss only for non-padded elements
+        pad_mask = (input_rep.sum(dim=1) != 0)
+        if pad_mask.any():
+            loss = self.loss_func(logits[pad_mask], target[pad_mask])
+        else:
+            loss = torch.tensor(0.0, device=logits.device)
 
         return loss
+    
+    def calculate_neg_loss(self, input_rep, x_neg, pad_mask):
+        n_items = self.model.backbone.item_embedding.weight.size(0)
+        batch_size = input_rep.size(0)
+        chunk_size = 32
+        total_loss = 0
+        total_valid = 0
+        
+        for i in range((batch_size + chunk_size - 1) // chunk_size):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, batch_size)
+            
+            chunk_input = torch.clamp(input_rep[start_idx:end_idx], 0, n_items-1)
+            chunk_neg = torch.clamp(x_neg[start_idx:end_idx], 0, n_items-1)
+            chunk_mask = pad_mask[start_idx:end_idx]
+            
+            input_emb = self.model.backbone.item_embedding(chunk_input)
+            neg_emb = self.model.backbone.item_embedding(chunk_neg)
+            
+            logits = torch.matmul(input_emb, neg_emb.transpose(-2, -1))
+            logits = logits.reshape(-1, logits.size(-1))
+            
+            chunk_mask = chunk_mask.reshape(-1)
+            target = torch.zeros(logits.size(0), dtype=torch.long, device=self.device)
+            
+            valid_mask = ~chunk_mask
+            if valid_mask.any():
+                chunk_loss = self.loss_func(logits[valid_mask], target[valid_mask])
+                total_loss += chunk_loss
+                total_valid += 1
+            
+            del input_emb, neg_emb, logits
+            torch.cuda.empty_cache()
+        
+        return total_loss / max(total_valid, 1)
+            
 
     def predict(self, predictions):
         all_embs = self.model.backbone.item_embedding.weight

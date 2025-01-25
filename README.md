@@ -22,7 +22,7 @@ In the pipeline, we demonstrate the relevance of our framework through an in-dep
 
 ```
 git clone https://github.com/ccloud98/Pipeline
-cd APC-RTA
+cd Pipeline
 pip install -r requirements.txt
 ```
 
