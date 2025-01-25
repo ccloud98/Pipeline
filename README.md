@@ -28,8 +28,13 @@ In the paper, we demonstrate the relevance of our framework through an in-depth 
 ### Code
 
 ```
+<<<<<<< HEAD
 git clone https://github.com/deezer/APC-RTA
 cd APC-RTA
+=======
+git clone https://github.com/ccloud98/Pipeline
+cd Pipeline
+>>>>>>> 30bbd26... PISA_v2
 pip install -r requirements.txt
 ```
 

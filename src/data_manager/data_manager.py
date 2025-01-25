@@ -25,7 +25,7 @@ class DataManager():
       - Gives access to embeddings'''
   N_SEED_SONGS = range(1,11) # possible configurations for evaluation
 
-  def __init__(self, foldername = "resources/data/", test_size=10000, min_songs_test=10, resplit=False, dim=128):
+  def __init__(self, foldername = "resources/data/", test_size=200000, min_songs_test=10, resplit=False, dim=128):
     self.foldername = foldername 
     
     self.test_size = test_size

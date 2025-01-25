@@ -23,6 +23,8 @@ if __name__ == "__main__":
                     help = "path to data", default="resources/data/baselines")
     parser.add_argument("--params_file", type = str, required = False,
                     help = "file for parameters", default="resources/params/best_params_baselines.json")
+    parser.add_argument("--models_path", type = str, required = False,
+                    help = "Path to save models", default = "resources/recos")
     args = parser.parse_args()
     with open(args.params_file, "r") as f:
       p = json.load(f)
@@ -32,6 +34,9 @@ if __name__ == "__main__":
     data_manager = DataManager()
 
     df_train = pd.read_hdf("%s/df_train_for_test" % args.data_path)
+    
+    savePath = "%s/%s" % (args.models_path, args.model_name)
+
     if args.model_name == "VSKNN":
         knnModel = VMContextKNN(k=tr_params["k"], sample_size=tr_params["n_sample"], weighting=tr_params["w"], weighting_score=tr_params["w_score"],  idf_weighting=tr_params["idf_w"])
 
