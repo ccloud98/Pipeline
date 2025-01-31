@@ -37,7 +37,18 @@ class PISA:
         self.item_session_map = {}
         self.session_time = {}
 
-   def run_training(self, train, tuning=False, savePath=None, epochs=10, val_size=0.1):
+   def run_training(self, train, tuning=False, savePath=None, epochs=10, val_size=0.1, lr_scheduler_args=None):
+    # lr_scheduler 인자가 없으면 기본값 설정
+    if lr_scheduler_args is None:
+        lr_scheduler_args = {'T_max': epochs, 'eta_min': 0.0}
+
+        # CosineAnnealingLR 스케줄러 초기화
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        self.optimizer,
+        T_max=lr_scheduler_args['T_max'],
+        eta_min=lr_scheduler_args['eta_min']
+    )
+    
     start_time = time.time()
     index_session = train.columns.get_loc(self.session_key)
     index_item = train.columns.get_loc(self.item_key)
@@ -67,9 +78,11 @@ class PISA:
             
             progress_bar.update(1)
         
-        # # Validation loss 계산 및 출력
-        # val_loss = self.calculate_validation_loss(train, val_size=val_size)
-        # print(f"Epoch {epoch+1} Validation Loss: {val_loss:.4f}")
+        # Validation loss 계산 및 출력
+        val_loss = self.calculate_validation_loss(train, val_size=val_size)
+        print(f"Epoch {epoch+1}/{epochs} - Validation Loss: {val_loss:.4f}")
+
+        scheduler.step()
 
         if savePath:
             torch.save(self, savePath)

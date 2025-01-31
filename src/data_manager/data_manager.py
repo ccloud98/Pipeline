@@ -15,6 +15,7 @@ import math
 from src.evaluator import Evaluator
 from torch.utils.data import DataLoader
 import scipy.sparse
+from torch.nn.utils.rnn import pad_sequence
 
 class DataManager():
   '''A class managing data access for models/evaluators.
@@ -235,55 +236,52 @@ class negative_sampler(object):
 class SequentialTrainDataset(Dataset):
     # This class is used to load the training set. If a playlist is shorter than max_size = 50 song, select entire playmist
     # and pad later. Otherwise, randomly select a subplaylist of 50 consecutive tracks.
-    def __init__(self, data_manager, indices, max_size=50, n_pos=3, n_neg=10, sample_size=None):
-      self.max_size = max_size
-      self.n_pos = n_pos
-      self.n_neg = n_neg
+    def __init__(self, data_manager, indices, max_size=50, n_neg=10, sample_size=None):
+        super().__init__()
+        self.max_size = max_size
+        self.n_neg = n_neg
 
-      if sample_size is not None:
-          sampled_indices = np.random.choice(indices, size=sample_size, replace=False)
-          self.data = data_manager.playlist_track[sampled_indices]
-      else:
-          self.data = data_manager.playlist_track[indices]
-      
-      if isinstance(self.data, scipy.sparse.spmatrix):
-          print(f"샘플링된 데이터 크기: {self.data.shape[0]} (sparse matrix)")
-      else:
-          print(f"샘플링된 데이터 크기: {len(self.data)}")
+        # train_indices에서 sample_size만큼만 선택(샘플링) 가능
+        if sample_size is not None and sample_size < len(indices):
+            sampled_indices = np.random.choice(indices, size=sample_size, replace=False)
+        else:
+            sampled_indices = indices
 
-      self.neg_generator = negative_sampler(data_manager.n_tracks + 1)
+        # playlist_track: [n_playlists, n_items] 형태의 sparse matrix
+        self.data = data_manager.playlist_track[sampled_indices]
 
-    def __getitem__(self, index):
-      A = self.data[index].indices + 1
-      B = self.data[index].data
-      seq = np.array([x for y, x in sorted(zip(B, A))])  # sort by position in the playlist, but keep song indices
-      l = len(seq)
-      if l <= self.max_size:
-        #X = seq
-        inputs = np.pad(seq, (0, self.max_size - l), mode='constant', constant_values=0)
-      else:
-        start = np.random.randint(0, l - (self.max_size))
-        #X = seq[start:start + self.max_size]
-        inputs = seq[start:start + self.max_size]
-      #y_neg = self.sample_except_with_generator(self.n_neg, seq)
+        # 디버그용
+        print(f"SequentialTrainDataset created with {self.data.shape[0]} playlists")
 
-      targets = self.sample_except_with_generator(self.n_neg, seq)
+    def __getitem__(self, idx):
+        # self.data[idx]는 한 playlist의 (indices, data) => (item indices, positions 등)
+        items = self.data[idx].indices   # 시퀀스 아이템(0-based)
+        # 만약 positions 쓰는 로직이 있으면 self.data[idx].data 에서 꺼낼 수 있음
 
-      #return torch.LongTensor(X), torch.LongTensor(y_neg)
-      return torch.LongTensor(inputs), torch.LongTensor(targets)
+        # items가 빈 세션일 수도 있으니 체크
+        if len(items) < 2:
+            # 아이템이 1개 미만이면(정답 생성 불가) dummy 처리
+            return torch.LongTensor([0]), torch.LongTensor([0])
+
+        # 마지막 아이템을 라벨로
+        last_item = items[-1]
+        # 나머지를 입력 시퀀스로
+        seq = items[:-1]
+        l = len(seq)
+
+        # seq가 max_size보다 길면 랜덤 위치로 잘라 쓸 수도 있음
+        if l > self.max_size:
+            start = random.randint(0, l - self.max_size)
+            seq = seq[start : start + self.max_size]
+        # pad up to max_size
+        seq = np.pad(seq, (0, self.max_size - len(seq)), 'constant', constant_values=0)
+
+        inputs = torch.LongTensor(seq)         # shape [max_size]
+        label  = torch.LongTensor([last_item]) # shape [1]
+        return inputs, label
 
     def __len__(self):
-      return self.data.shape[0]
-
-    def sample_except_with_generator(self, n_samples, excluded_values):
-      # Sample negative examples but remove songs that appear in the playlist
-      l = len(excluded_values)
-      raw_samples = self.neg_generator.next(n_samples)
-      diff = set(raw_samples).difference(excluded_values)
-      while (len(diff) < n_samples):
-        l_res = n_samples - len(diff)
-        diff = diff.union(set(self.neg_generator.next(l_res)).difference(excluded_values))
-      return list(diff)
+        return self.data.shape[0]
 
 
 # Test : for each row, split text, convert to int, select 5 first tracks. Predict following tracks
@@ -300,16 +298,28 @@ class EvaluationDataset(Dataset):
     def __len__(self):
         return self.data.shape[0]
 
-# def pad_collate(batch):
-#     # Defines how playlists of different sizes should be turned into a batch using padding
-#     (xx, yy_neg) = zip(*batch)
-#     x_lens = [len(x) for x in xx]
-#     xx_pad = pad_sequence(xx, batch_first=True, padding_value=0)
-#     return xx_pad, torch.stack(list(yy_neg)), torch.LongTensor(list(x_lens))
-
 def pad_collate(batch):
-    inputs, targets = zip(*batch)  # 입력과 타겟을 분리
-    inputs_padded = pad_sequence(inputs, batch_first=True, padding_value=0)  # 패딩 처리
-    targets = torch.stack(targets)  # 타겟 데이터 스택
-    len_str = torch.tensor([len(input) for input in inputs])  # 각 시퀀스의 길이 정보
-    return inputs_padded, targets, len_str  # len_str을 추가로 반환
+    """
+    - batch: list of (inputs, label) tuples
+    - inputs shape: [max_size], label shape: [1]
+    => pad_sequence는 길이가 제각각일 때 필요하지만,
+       여기서는 이미 max_size로 맞췄으므로 pad_sequence는 생략해도 됨.
+    """
+    inputs_list, labels_list = zip(*batch)  # 각각 튜플 언팩
+    # inputs_list: tuple of [max_size] 텐서 => stack
+    inputs_padded = torch.stack(inputs_list, dim=0)  # [B, max_size]
+    labels = torch.stack(labels_list, dim=0).squeeze(1)  # [B, 1] -> [B]
+
+    # lens: 각 시퀀스 실제 길이(패딩 전)를 구하려면(seq.count_nonzero 등) 가능
+    lens = []
+    for inp in inputs_list:
+        count_nonzero = (inp != 0).sum().item()
+        lens.append(count_nonzero)
+    lens = torch.LongTensor(lens)
+
+    batch_dict = {
+        "orig_sess": inputs_padded,   # [B, max_size]
+        "labels": labels,             # [B]
+        "lens": lens                  # [B]
+    }
+    return batch_dict
