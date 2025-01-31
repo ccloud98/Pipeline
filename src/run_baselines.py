@@ -121,12 +121,14 @@ if __name__ == "__main__":
     if isinstance(knnModel, nn.Module):
         device_count = torch.cuda.device_count()
         if device_count > 1:
-            print(f"[Info] {device_count} GPUs detected. Using DataParallel...")
+            print(f"[Info] Detected {device_count} GPUs. Using DataParallel with device_ids=range({device_count}).")
             knnModel = nn.DataParallel(knnModel, device_ids=list(range(device_count)))
             knnModel.to("cuda")
         else:
             knnModel.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-
+    else:
+        pass  # KNN 모델 등은 CPU or single GPU
+    
     # 5) 테스트 세션(마지막 아이템)
     last_item = (
         df_train[df_train.SessionId.isin(data_manager.test_indices)]
