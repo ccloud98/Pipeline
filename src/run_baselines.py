@@ -9,7 +9,7 @@ from src.baselines.vsknn import VMContextKNN
 from src.baselines.sknn import ContextKNN
 from src.baselines.vstan import VSKNN_STAN
 from src.baselines.stan import STAN
-from src.baselines.muse import MUSE
+from src.baselines.muse import MUSE   # ← 수정된 MUSE (negative sampling + multi-target)
 from src.baselines.larp import LARP
 from src.baselines.pisa import PISA
 
@@ -30,20 +30,21 @@ if __name__ == "__main__":
                         help="file for parameters", default="resources/params/best_params_baselines.json")
     parser.add_argument("--models_path", type=str, required=False,
                         help="Path to save models", default="resources/recos")
-    # (A) 샘플링 크기를 직접 지정할 수 있도록 인자 추가 (선택)
-    parser.add_argument("--sample_size", type=int, default=1000,
+
+    # (A) 샘플링 크기를 직접 지정할 수 있도록 인자 추가 (negative sampling 시 세션 개수 줄이기 등)
+    parser.add_argument("--sample_size", type=int, default=100000,
                         help="Number of train playlists to sample for training (default=10000)")
 
     args = parser.parse_args()
 
     # 1) 하이퍼파라미터 로드
     with open(args.params_file, "r") as f:
-        p = json.load(f)
-    tr_params = p[args.model_name]
+        all_params = json.load(f)
+    tr_params = all_params[args.model_name]
 
-    # 2) DataManager 및 데이터 로드
+    # 2) DataManager 로드
     data_manager = DataManager()
-    df_train = pd.read_hdf(f"{args.data_path}/df_train_for_test")
+    df_train = pd.read_hdf(f"{args.data_path}/df_train_for_test")  # 실제 데이터
     savePath = f"{args.models_path}/{args.model_name}"
 
     # 3) 모델 생성
@@ -62,6 +63,7 @@ if __name__ == "__main__":
             similarity=tr_params["s"]
         )
     elif args.model_name == "VSTAN":
+        # time 보정
         df_train["Time"] = df_train["Time"] / 1000
         knnModel = VSKNN_STAN(
             k=tr_params["k"],
@@ -85,6 +87,8 @@ if __name__ == "__main__":
             embed_dim=tr_params.get("embed_dim", 256)
         )
     elif args.model_name == "MUSE":
+        # 수정된 MUSE (negative sampling + multi-target)
+        # => MUSE 내부에 'compute_loss_batch(x_pos, x_neg)' 등 구현
         knnModel = MUSE(
             data_manager=data_manager,
             k=tr_params["k"],
@@ -125,10 +129,12 @@ if __name__ == "__main__":
             knnModel = nn.DataParallel(knnModel, device_ids=list(range(device_count)))
             knnModel.to("cuda")
         else:
+            # single GPU or CPU
             knnModel.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     else:
-        pass  # KNN 모델 등은 CPU or single GPU
-    
+        # KNN 모델 등은 CPU나 single GPU
+        pass
+
     # 5) 테스트 세션(마지막 아이템)
     last_item = (
         df_train[df_train.SessionId.isin(data_manager.test_indices)]
@@ -140,16 +146,16 @@ if __name__ == "__main__":
     unknown_tracks = list(set(all_tids) - set(df_train.ItemId.unique()))
     test_to_last = array_mapping(data_manager.test_indices, last_item.SessionId.values)
 
-    # 6) 학습(run_training) - MUSE 모델 예시에서 샘플링 적용
-    #    (KNN계열에선 run_training(train=df_train) 형태로 그대로 호출)
+    # 6) 학습(run_training)
     start_fit = time.time()
     print("Start fitting", args.model_name, "model")
 
+    # sample_size => 정해진 플레이리스트만 사용
     if isinstance(knnModel, nn.DataParallel):
-        # DataParallel
-        knnModel.module.run_training(train=df_train, tuning=False, savePath=savePath, sample_size=10000)  # ← 여기서 sample_size 사용하도록 MUSE 내부 수정
+        # DataParallel -> knnModel.module
+        knnModel.module.run_training(train=df_train, tuning=False, savePath=savePath, sample_size=args.sample_size)
     else:
-        knnModel.run_training(train=df_train, tuning=False, savePath=savePath)          # ← 동일
+        knnModel.run_training(train=df_train, tuning=False, savePath=savePath, sample_size=args.sample_size)
 
     end_fit = time.time()
     print("Training done in %.2f seconds" % (end_fit - start_fit))
@@ -169,9 +175,11 @@ if __name__ == "__main__":
     ):
         pl_tracks = df_train[df_train.SessionId == pid].ItemId.values
         scores = predict_fn(pid, tid, all_tids)
+
         if len(scores.shape) != 1:
             scores = scores.flatten()
 
+        # 예측 결과 중 이미 본 곡, unknown 곡 제외
         pl_tracks_valid = pl_tracks[pl_tracks < len(scores)]
         unknown_tracks_valid = [idx for idx in unknown_tracks if idx < len(scores)]
         scores[pl_tracks_valid] = 0

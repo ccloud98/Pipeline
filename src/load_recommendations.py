@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from evaluator import Evaluator
 from src.data_manager.data_manager import DataManager
+import os
 
 # 추천 결과 파일 경로 설정
 recos_paths = {
@@ -12,9 +13,9 @@ recos_paths = {
     # 'MF-AVG': 'resources/recos/MF-AVG.npy',
     
     'SKNN': 'resources/recos/VSKNN.npy',
-    # 'STAN': 'resources/recos/VSKNN.npy',
-    # 'VSTAN': 'resources/recos/VSKNN.npy',
-    # 'VSKNN': 'resources/recos/VSKNN.npy',
+    #  'STAN': 'resources/recos/VSKNN.npy',
+    #  'VSTAN': 'resources/recos/VSKNN.npy',
+    #  'VSKNN': 'resources/recos/VSKNN.npy',
 
     'MUSE' : 'resources/recos/MUSE.npy',
     'LARP' : 'resources/recos/LARP.npy',
@@ -62,3 +63,11 @@ metrics_df = pd.DataFrame(metrics_results).T
 
 # 데이터프레임 확인
 print(metrics_df)
+
+# CSV 파일로 저장 (폴더 경로 포함)
+output_folder = 'metrics_results'
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+metrics_df.to_csv(os.path.join(output_folder, 'recommendation_metrics_results.csv'))
+
+print("save metrics_results")
