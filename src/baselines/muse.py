@@ -9,10 +9,8 @@ from torch.utils.data import DataLoader
 
 from src.data_manager.data_manager import SequentialTrainDataset, pad_collate
 from src.rta.utils import get_device
+from typing import Tuple
 
-#########################################
-# MUSE 클래스 (2D, 최종 시점만 사용, pos/neg)
-#########################################
 class MUSE(nn.Module):
     def __init__(self, data_manager,
                  k=1500, n_items=2262292, hidden_size=128, lr=0.01, batch_size=64,
@@ -22,9 +20,15 @@ class MUSE(nn.Module):
         super().__init__()
         self.data_manager = data_manager
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
 
         self.batch_size = batch_size
         self.n_sample = n_sample
+        self.n_items = n_items
+        self.hidden_size = hidden_size
+
+        self.current_session_id = -1
+        self.current_sequence = []
 
         # config
         self.config = {
@@ -36,9 +40,9 @@ class MUSE(nn.Module):
             "var_coeff": var_coeff,
             "cov_coeff": cov_coeff,
             "n_layers": n_layers,
-            "maxlen": maxlen
+            "maxlen": maxlen,
+            "dropout": dropout
         }
-        self.n_items = n_items
         self.lr = lr
         self.alpha = alpha
         self.inv_coeff = inv_coeff
@@ -66,7 +70,6 @@ class MUSE(nn.Module):
 
         # VICReg 백본 (SRGNN)
         self.model = VICReg(self.n_items, self.config).to(self.device)
-        # 추가: aggregator hidden dimension vs item embedding dimension 체크
         aggregator_hidden_dim = self.model.backbone.hidden_size
         item_emb_dim = self.model.backbone.item_embedding.embedding_dim
         assert aggregator_hidden_dim == item_emb_dim, (
@@ -205,53 +208,76 @@ class MUSE(nn.Module):
         pad_mask = (x_pos==0).to(self.device)
         lengths  = torch.sum(~pad_mask, dim=1)  # [B], 이 값은 항상 >=2
 
-        # aggregator forward
-        hidden, preds = self.model({
-            "orig_sess": x_pos,
-            "lens": lengths
-        }, get_last=True)  # preds -> [B, hidden]
+        # SRGNN forward
+        seq_hidden, _ = self.model(
+            {"orig_sess": x_pos, "lens": lengths}, 
+            get_last=False
+        )  
 
-        # pos_id
-        # => sum(~pad_mask, dim=1)-1 >= 1
-        pos_id = x_pos[range(x_pos.size(0)), lengths-1] 
+        B, seq_len = x_pos.shape
 
-        B, d = preds.shape
+        # 예측과 타겟 설정
+        preds = seq_hidden[:, :-1, :]  # [B, seq_len-1, hidden]
+        pos_ids = x_pos[:, 1:]         # [B, seq_len-1]
+        valid_mask = pad_mask[:, 1:]   # [B, seq_len-1] True=padding  
+        neg_samples = x_neg.unsqueeze(1).expand(-1, seq_len-1, -1)  # [B, seq_len-1, n_neg]
 
-        # neg_emb => [B, n_neg, d]
+        # 임베딩
         item_emb = self.model.backbone.item_embedding
-        neg_emb = item_emb(x_neg)
-        BN, n_neg, d_emb = neg_emb.shape
-        if BN != B or d_emb != d:
-            raise RuntimeError("neg_emb shape mismatch with aggregator output")
+        pos_emb = item_emb(pos_ids)  # [B, seq_len-1, hidden]
+        # neg_emb: [B, seq_len-1, n_neg, hidden]
+        neg_emb = item_emb(neg_samples).view(B, seq_len-1, -1, self.config["hidden_size"])
 
-        # pos_emb => [B, d]
-        pos_emb = item_emb(pos_id)
-
-        # Positive dot
-        pos_dot  = torch.sum(preds * pos_emb, dim=1, keepdim=True)
-        pos_loss = -F.logsigmoid(pos_dot).mean()
-
-        # Negative dot
-        neg_dot  = torch.einsum("bd,bnd->bn", preds, neg_emb)
-        neg_loss = -F.logsigmoid(-neg_dot).mean()
-
-        total_loss = pos_loss + neg_loss
-        return total_loss
+        # dot products
+        # preds: [B, seq_len-1, hidden]
+        # pos_emb: [B, seq_len-1, hidden]
+        pos_dot = torch.sum(preds * pos_emb, dim=-1)  # [B, seq_len-1]
+        
+        # preds: [B, seq_len-1, 1, hidden]
+        # neg_emb: [B, seq_len-1, n_neg, hidden]
+        preds_expanded = preds.unsqueeze(2)
+        neg_dot = torch.sum(preds_expanded * neg_emb, dim=-1)  # [B, seq_len-1, n_neg]
+        
+        # log-sigmoid
+        pos_loss = -F.logsigmoid(pos_dot)  # [B, seq_len-1]
+        neg_loss = -F.logsigmoid(-neg_dot).mean(dim=-1)  # [B, seq_len-1]
+        
+        # mask out padding steps
+        mask_float = (~valid_mask).float()
+        pos_loss = pos_loss * mask_float
+        neg_loss = neg_loss * mask_float
+        
+        # 평균 - 전체 valid 클릭 수로 나눔
+        valid_counts = mask_float.sum()
+        if valid_counts == 0:
+            return torch.tensor(0.0, device=self.device)
+        
+        final_loss = (pos_loss.sum() + neg_loss.sum()) / valid_counts
+        return final_loss
 
     def predict_next(self, session_id, input_item_id, predict_for_item_ids):
+        if session_id != self.current_session_id:
+            self.current_session_id = session_id
+            self.current_sequence = []
+        # 세션 아이템 누적
+        self.current_sequence.append(input_item_id)
+
+        # 이제 self.current_sequence 전체를 GNN에 넣음
+        x = torch.tensor([self.current_sequence], device=self.device)  # [1, seq_len]
+        lengths = torch.tensor([len(self.current_sequence)], device=self.device)
+
+        # SRGNN forward
         self.model.eval()
         with torch.no_grad():
-            x = torch.tensor([[input_item_id + 1]], device=self.device)
-            lens = torch.tensor([1], device=self.device)
-            hidden, preds = self.model({"orig_sess": x, "lens": lens}, get_last=True)
-            # item_emb: [n_items+2, hidden] (n_items+2로 변경!)
-            item_emb = self.model.backbone.item_embedding.weight
-            logits   = torch.matmul(preds, item_emb.T).squeeze(0)  # [n_items+2]
-            scores   = torch.softmax(logits, dim=-1).cpu().numpy()
+            _, preds = self.model({"orig_sess": x, "lens": lengths}, get_last=True)
+            # preds => [1, hidden]
+            preds = preds.squeeze(0)  # [hidden]
+            item_emb = self.model.backbone.item_embedding.weight  # [n_items+1, hidden]
+            logits = torch.matmul(preds, item_emb.T)  # [n_items+1]
+            scores = torch.softmax(logits, dim=-1).cpu().numpy()
 
         final_scores = np.zeros(len(predict_for_item_ids), dtype=np.float32)
         for i, gid in enumerate(predict_for_item_ids):
-            # gid가 0 이상 n_items 미만이면, +1 한 위치의 score를 취함
             if 0 <= gid < self.n_items:
                 final_scores[i] = scores[gid+1]
         return final_scores
@@ -327,34 +353,33 @@ class SRGNN(nn.Module):
         for w in self.parameters():
             w.data.uniform_(-stdv,stdv)
 
-    def forward(self, batch, input_str='orig_sess', len_str='lens', get_last=True):
-        seqs = batch[input_str] # [B, seq_len]
-        lengths_t = batch[len_str] # [B]
+    def forward(self, batch, input_str='orig_sess', len_str='lens', get_last=True)-> Tuple[torch.Tensor, torch.Tensor]:
+        seqs = batch[input_str]       # [B, seq_len]
+        lengths_t = batch[len_str]    # [B]
 
+        # (1) GNN + gather
         alias_inputs, A, items, mask = self._get_slice(seqs)
-        hidden = self.gnn(A, self.item_embedding(items))   # [B,n_nodes,hidden]
+        hidden = self.gnn(A, self.item_embedding(items))  # [B, n_nodes, hidden]
 
-        if alias_inputs.numel()>0:
-            alias_inputs = alias_inputs.view(alias_inputs.size(0),-1,1).expand(-1,-1,self.hidden_size)
+        if alias_inputs.numel() > 0:
+            alias_inputs = alias_inputs.view(alias_inputs.size(0), -1, 1).expand(-1, -1, self.hidden_size)
         else:
-            alias_inputs = torch.zeros(1,1,self.hidden_size, device=self.device)
-
+            alias_inputs = torch.zeros(1, 1, self.hidden_size, device=self.device)
         alias_inputs = alias_inputs.long()
-        seq_hidden   = torch.gather(hidden,1, alias_inputs) # [B, seq_len, hidden]
+        seq_hidden   = torch.gather(hidden, 1, alias_inputs)  # [B, seq_len, hidden]
 
-        if get_last:
-            # => [B, hidden]
-            ht = self.get_last_item(seq_hidden, lengths_t)
-        else:
-            # => [B, seq_len, hidden]
-            ht = seq_hidden
+        ht = self.get_last_item(seq_hidden, lengths_t)  # [B, hidden]
 
-        q1 = self.linear1(ht).unsqueeze(1) # shape [B,1,hidden]
-        q2 = self.linear2(seq_hidden)       # [B,seq_len,hidden]
-        alp= self.linear3(torch.sigmoid(q1+q2))
+        # (3) alpha-attn
+        q1 = self.linear1(ht).unsqueeze(1)             # [B,1,hidden]
+        q2 = self.linear2(seq_hidden)                   # [B,seq_len,hidden]
+        alp= self.linear3(torch.sigmoid(q1 + q2))       # [B,seq_len,hidden]
 
+        # (4) sum over seq_len => a: [B, hidden]
         a = torch.sum(alp * seq_hidden * mask.unsqueeze(-1).float(), dim=1)
-        seq_output= self.linear_transform(torch.cat([a, ht], dim=1)) # if get_last: shape [B,hidden]
+
+        # (5) concat => [B, 2*hidden] => transform => [B, hidden]
+        seq_output = self.linear_transform(torch.cat([a, ht], dim=1))
 
         return seq_hidden, seq_output
 
@@ -440,9 +465,10 @@ class VICReg(nn.Module):
 
         self.backbone= SRGNN(input_size, config)
 
-    def forward(self, batch, input_str='orig_sess', len_str='lens', get_last=True):
-        hidden, preds= self.backbone(batch, input_str, len_str, get_last)
-        return hidden, preds
+    def forward(self, batch: dict, input_str: str = 'orig_sess', len_str: str = 'lens', get_last: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_hidden, seq_output = self.backbone(batch, input_str, len_str, get_last)
+        return seq_hidden, seq_output
 
     def global_loss(self, embeddings):
         inv_loss=0.0

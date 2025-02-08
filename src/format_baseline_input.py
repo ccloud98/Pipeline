@@ -47,7 +47,7 @@ def prepare_knn_data(data_manager, data_path):
   playlist_data = pd.read_hdf("%s/playlist_data" % data_path)
   df_data = df_data.merge(playlist_data[["pid", "modified_at"]].rename(columns={"pid":"SessionId"}), on="SessionId")
   df_data = df_data.merge(pd.DataFrame(data_manager.tracks_info.values())[["id", "duration_ms"]].rename(columns={'id':"ItemId"}), on="ItemId")
-  df_data.sort_values(["SessionId", "Pos"], ascending = [True,  False], inplace=True)
+  df_data.sort_values(["SessionId", "Pos"], ascending=[True, True], inplace=True)
   df_data["duration_sum"] = df_data.groupby('SessionId')["duration_ms"].cumsum()
   df_data["Time"] = df_data["modified_at"] - df_data["duration_sum"]
   return df_data

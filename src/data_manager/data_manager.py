@@ -18,7 +18,7 @@ class DataManager():
     def __init__(
         self,
         foldername = "resources/data/",
-        test_size=200000,
+        test_size=900000,
         min_songs_test=10,
         resplit=False,
         dim=128
@@ -63,7 +63,16 @@ class DataManager():
         self.prepare_charts()
 
     def load_playlist_track(self):
-        self.playlist_track = scipy.sparse.load_npz("%s/rta_input/playlist_track.npz" % self.foldername)
+        # 새로 만들어진 playlist_track_custom.npz 사용
+        custom_path = os.path.join(self.foldername, "rta_input", "playlist_track_custom.npz")
+        self.playlist_track = scipy.sparse.load_npz(custom_path)
+        # 세션/트랙 개수를 새로 맞추기
+        self.n_playlists, self.n_tracks = self.playlist_track.shape
+        print(f"[DataManager] Loaded custom matrix shape = {self.n_playlists} x {self.n_tracks}")
+
+        # (선택) 세션/트랙 개수 업데이트
+        self.n_playlists = self.playlist_track.shape[0]
+        self.n_tracks    = self.playlist_track.shape[1]
   
     def load_playlist_artist(self):
         self.playlist_artist = scipy.sparse.load_npz("%s/rta_input/playlist_artist.npz" % self.foldername)
@@ -126,19 +135,20 @@ class DataManager():
         self.ordered_tracks = np.array(self.ordered_tracks)
 
     def split_sets(self):
-        playlist_track_csc = self.playlist_track.tocsc()
-        rng = np.random.default_rng()
-        candidate_indices = rng.choice(
-            list(set(playlist_track_csc.indices[playlist_track_csc.data>2*self.min_songs_test])), 2*self.test_size, replace=False)
-        test_indices = candidate_indices[:self.test_size] 
-        val_indices  = candidate_indices[self.test_size:]
-        train_indices = [i for i in range(self.n_playlists) if i not in candidate_indices]
+        # 새로 만들어진 playlist_track_custom.npz에 맞춰 재정의
+        n_sess = self.playlist_track.shape[0]
+        indices = np.arange(n_sess)
+        np.random.shuffle(indices)
+        train_size = int(n_sess * 0.9)  # 예: 80% train
+        val_size   = int(n_sess * 0.05)  # 10%
+        train_idx  = indices[:train_size]
+        val_idx    = indices[train_size:train_size+val_size]
+        test_idx   = indices[train_size+val_size:]
+        np.save(f"{self.foldername}/dataset_split/train_indices", train_idx)
+        np.save(f"{self.foldername}/dataset_split/val_indices",   val_idx)
+        np.save(f"{self.foldername}/dataset_split/test_indices",  test_idx)
 
-        np.save('%s/dataset_split/train_indices' % (self.foldername), train_indices)
-        np.save('%s/dataset_split/val_indices'   % (self.foldername), val_indices)
-        np.save('%s/dataset_split/test_indices'  % (self.foldername), test_indices)
-
-    def get_indices(self, set_name, resplit=False):
+    def get_indices(self, set_name, resplit=True):
         if resplit:
             self.split_sets()
         return np.load(f"{self.foldername}/dataset_split/{set_name}_indices.npy")
@@ -155,7 +165,7 @@ class DataManager():
         valid_positions = np.array(sorted([p for p in range(test_size) if p not in invalid_positions]))
         return test_indices[valid_positions]
   
-    def get_ground_truth(self, set_name, binary=True, resplit=False, n_start_songs=False):
+    def get_ground_truth(self, set_name, binary=True, resplit=True, n_start_songs=False):
         if not n_start_songs:
             n_start_songs = self.min_songs_test
         indices = self.get_indices(set_name, resplit)
@@ -173,7 +183,7 @@ class DataManager():
             ground_truth_list_first.append(set(ground_truth_first.indices[ground_truth_first.indptr[i]:ground_truth_first.indptr[i+1]]))
         return start_data, ground_truth_list, ground_truth_list_first
 
-    def get_train_set(self, binary=True, resplit=False):
+    def get_train_set(self, binary=True, resplit=True):
         train_indices = self.get_indices("train", resplit)
         train_set = self.playlist_track[train_indices]
         if binary:
@@ -222,7 +232,7 @@ class negative_sampler(object):
 
 
 class SequentialTrainDataset(Dataset):
-    def __init__(self, data_manager, indices, max_size=50, n_neg=10, sample_size=None):
+    def __init__(self, data_manager, indices, max_size=50, n_neg=50, sample_size=None):
         super().__init__()
         self.max_size = max_size
         self.n_neg = n_neg

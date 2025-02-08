@@ -2,169 +2,293 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
 import tqdm
 import time
-from torch.utils.data import DataLoader, TensorDataset
 
-class PISA:
-   def __init__(self, n_sample=2252463, k=100, sample_size=1000, sampling='recent', embed_dim=256, queue_size=57600, momentum=0.995, session_key='SessionId', item_key='ItemId', time_key='Time', device='cuda'):
-        self.n_sample = n_sample
-        self.k = k
-        self.sample_size = sample_size
-        self.sampling = sampling
+from src.data_manager.data_manager import SequentialTrainDataset, pad_collate
+from src.data_manager.data_manager import negative_sampler
+from src.evaluator import Evaluator
 
+
+class PISA(nn.Module):
+    def __init__(
+        self,
+        data_manager,
+        k=100,
+        n_sample=5000,
+        sampling="random",
+        embed_dim=128,
+        queue_size=4096,
+        momentum=0.9,
+        session_key="SessionId",
+        item_key="ItemId",
+        time_key="Time",
+        device="cuda",
+        training_params=None
+    ):
+        super(PISA, self).__init__()
+
+        self.data_manager = data_manager
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+        if training_params is None:
+            training_params = {}
+        self.training_params = training_params
+        self.n_epochs   = training_params.get("n_epochs", 30)
+        self.batch_size = training_params.get("batch_size", 16)
+        self.lr         = training_params.get("lr", 0.001)
+        self.wd         = training_params.get("wd", 1e-5)
+        self.mom        = training_params.get("mom", 0.9)
+        self.nesterov   = training_params.get("nesterov", True)
+        self.n_neg      = training_params.get("n_neg", 10)
+        self.max_size   = training_params.get("max_size", 50)
+        self.clip       = training_params.get("clip", 5.0)
+
+        self.patience   = self.training_params.get("patience", 3) 
+        self.factor     = self.training_params.get("factor", 0.5) 
+        self.step_size  = self.training_params.get("step_size", 1) 
+        self.step_every = self.training_params.get("step_every", None)
+
+        # 임베딩 차원
         self.embed_dim = embed_dim
-        self.queue_size = queue_size 
-        self.momentum = momentum
+        # 전체 아이템 개수 (+2 해서 padding_idx 용)
+        self.n_items   = self.data_manager.n_tracks + 2  
 
-        self.session_key = session_key
-        self.item_key = item_key
-        self.time_key = time_key
-        self.device = torch.device(device)
+        self.item_embedding = nn.Embedding(
+            num_embeddings=self.n_items,
+            embedding_dim=self.embed_dim,
+            padding_idx=0
+        )
+        self.gru = nn.GRU(
+            input_size=self.embed_dim,
+            hidden_size=self.embed_dim,
+            num_layers=1,
+            batch_first=True
+        )
+        self.optimizer = None
+        self.scheduler = None
 
-        # Initialize embeddings
-        self.sample_embeddings = nn.Embedding(n_sample, embed_dim).to(self.device)
-        self.sample_embeddings.weight.data.uniform_(-0.01, 0.01)
-
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.sample_embeddings.parameters(), lr=0.01)
-
-        # Updated during recommendation
-        self.session = -1
-        self.session_items = []
-        self.relevant_sessions = set()
-        self.session_item_map = {}
-        self.item_session_map = {}
-        self.session_time = {}
-
-   def run_training(self, train, tuning=False, savePath=None, epochs=10, val_size=0.1, lr_scheduler_args=None):
-    # lr_scheduler 인자가 없으면 기본값 설정
-    if lr_scheduler_args is None:
-        lr_scheduler_args = {'T_max': epochs, 'eta_min': 0.0}
-
-        # CosineAnnealingLR 스케줄러 초기화
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        self.optimizer,
-        T_max=lr_scheduler_args['T_max'],
-        eta_min=lr_scheduler_args['eta_min']
-    )
+    def forward(self, x):
+        # x: [B, L]
+        emb = self.item_embedding(x)   # [B, L, embed_dim]
+        output, hidden = self.gru(emb)
+        return output
     
-    start_time = time.time()
-    index_session = train.columns.get_loc(self.session_key)
-    index_item = train.columns.get_loc(self.item_key)
-    index_time = train.columns.get_loc(self.time_key)
-    
-    for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
-        
-        progress_bar = tqdm.tqdm(train.itertuples(), total=len(train), desc=f"Training epoch {epoch+1}")
-        session = -1
-        session_items = []
-        current_time = -1
-        
-        for row in progress_bar:
-            if row[index_session] != session:
-                if len(session_items) > 0:
-                    self.session_item_map[session] = session_items
-                    self.session_time[session] = current_time
-                session = row[index_session]
-                session_items = []
-            current_time = row[index_time]
-            session_items.append(row[index_item])
-            
-            if row[index_item] not in self.item_session_map:
-                self.item_session_map[row[index_item]] = set()
-            self.item_session_map[row[index_item]].add(row[index_session])
-            
-            progress_bar.update(1)
-        
-        # Validation loss 계산 및 출력
-        val_loss = self.calculate_validation_loss(train, val_size=val_size)
-        print(f"Epoch {epoch+1}/{epochs} - Validation Loss: {val_loss:.4f}")
+    def chose_negative_examples(self, X_agg, x_neg, pad_mask):
+        n_easy = self.n_neg // 2
+        n_hard = self.n_neg - n_easy
 
-        scheduler.step()
+        X_neg_rep_full = self.item_embedding(x_neg)  # [B, n_neg, D]
+        easy_neg_rep   = X_neg_rep_full[:, :n_easy, :]  # [B, n_easy, D]
 
-        if savePath:
-            torch.save(self, savePath)
+        # session representation => pad 기반 평균
+        # X_agg : [B, seq_len, D]
+        # pad_mask: [B, seq_len], True=유효
+        X_agg_mean = padded_avg(X_agg, pad_mask)  # [B, D]
 
-   def calculate_validation_loss(self, data, val_size=0.1):
-        val_indices = np.random.choice(len(data), size=int(len(data) * val_size), replace=False)
-        val_data = data.iloc[val_indices]
-        
-        total_loss = 0
-        for _, row in val_data.iterrows():
-            session_id = row[self.session_key]
-            item_id = row[self.item_key]
-            
-            # n_sample 파라미터 사용
-            scores = self.predict_next(session_id, item_id, np.arange(self.n_sample))
-            loss = -np.log(scores[item_id] + 1e-10)
-            total_loss += loss
-                
-        return total_loss / len(val_data)
+        # neg_prods = batch-wise 내적 => [B, n_neg]
+        neg_prods = torch.einsum("bnd,bd->bn", X_neg_rep_full, X_agg_mean)
+        # topk
+        top_neg_indices = torch.topk(neg_prods, k=n_hard, dim=1)[1]  # [B, n_hard]
+        # gather => item id
+        # x_neg: [B, n_neg]
+        hard_indices = torch.gather(x_neg, 1, top_neg_indices)
+        hard_neg_rep = self.item_embedding(hard_indices)
 
-   def predict_next(self, session_id, input_item_id, predict_for_item_ids, timestamp=0):
-       if self.session != session_id:
-           self.session = session_id
-           self.session_items = []
-           self.relevant_sessions = set()
+        X_neg_final = torch.cat([easy_neg_rep, hard_neg_rep], dim=1)  # [B, n_neg, D]
+        return X_neg_final
 
-       self.session_items.append(input_item_id)
-       neighbors = self.find_neighbors(set(self.session_items), input_item_id, session_id)
-       scores = self.score_items(neighbors, self.session_items)
+    def compute_loss_batch(self, x_pos, x_neg):
+            x_pos = x_pos.to(self.device)
+            x_neg = x_neg.to(self.device)
+            # pad_mask: True=유효
+            pad_mask = (x_pos != 0)
 
-       # Normalize scores
-       max_score = max(scores.values()) if scores else 1
-       scores = {k: v / max_score for k, v in scores.items()}
+            # forward => [B, seq_len, D]
+            rep_all = self.forward(x_pos.to(self.device))
 
-       # Convert scores to numpy array
-       scores_array = np.array([scores.get(item_id, 0) for item_id in predict_for_item_ids])
+            # split
+            X_agg = rep_all[:, :-1, :]  # [B, seq_len-1, D]
+            Y_pos = rep_all[:, 1:,  :]  # [B, seq_len-1, D]
+            # pad_mask도 동일하게 shift
+            pad_mask_agg = pad_mask[:, :-1]
+            pad_mask_pos = pad_mask[:, 1:]
 
-       return scores_array
+            # negative
+            # easy+hard => [B, n_neg, D]
+            X_neg_rep = self.chose_negative_examples(X_agg, x_neg, pad_mask_agg)
 
-   def find_neighbors(self, session_items, input_item_id, session_id):
-       possible_neighbors = self.possible_neighbor_sessions(session_items, input_item_id, session_id)
-       neighbors = self.calc_similarity(session_items, possible_neighbors)
-       neighbors = sorted(neighbors, reverse=True, key=lambda x: x[1])[:self.k]
-       return neighbors
+            # 2) pos_loss
+            #   pos_prod: (X_agg * Y_pos).sum(-1) => [B, seq_len-1]
+            pos_prod = torch.sum(X_agg * Y_pos, dim=2)  # [B, seq_len-1]
+            # RTA style => padded_avg(-logsigmoid(pos_prod), pad_mask_pos)
+            pos_loss = padded_avg(-F.logsigmoid(pos_prod), pad_mask_pos).mean()
 
-   def possible_neighbor_sessions(self, session_items, input_item_id, session_id):
-       self.relevant_sessions |= self.item_session_map.get(input_item_id, set())
-       if len(self.relevant_sessions) > self.sample_size:
-           if self.sampling == 'recent':
-               sample = self.most_recent_sessions(self.relevant_sessions, self.sample_size)
-           elif self.sampling == 'random':
-               sample = random.sample(self.relevant_sessions, self.sample_size)
-           else:
-               sample = list(self.relevant_sessions)[:self.sample_size]
-           return sample
-       else:
-           return self.relevant_sessions
+            # 3) neg_loss
+            #   aggregator mean => [B, D]
+            X_agg_mean = padded_avg(X_agg, pad_mask_agg)  # [B, D]
+            # neg_prod => [B, n_neg] = X_neg_rep dot X_agg_mean
+            neg_prod = torch.einsum("bnd,bd->bn", X_neg_rep, X_agg_mean)
+            neg_loss = torch.mean(-F.logsigmoid(-neg_prod))
 
-   def calc_similarity(self, session_items, sessions):
-       neighbors = []
-       for session in sessions:
-           session_items_test = set(self.session_item_map.get(session, []))
-           similarity = self.jaccard(session_items, session_items_test)
-           if similarity > 0:
-               neighbors.append((session, similarity))
-       return neighbors
+            loss = pos_loss + neg_loss
+            return loss
 
-   def jaccard(self, first, second):
-       intersection = len(first & second)
-       union = len(first | second)
-       return intersection / union if union > 0 else 0
+    def run_training(self, train, tuning=False, savePath=None, sample_size=None):
+        print(f"[PISA] start training (tuning={tuning}), sample_size={sample_size}")
 
-   def score_items(self, neighbors, current_session):
-       scores = {}
-       for session, similarity in neighbors:
-           items = self.session_item_map.get(session, [])
-           for item in items:
-               if item not in current_session:
-                   scores[item] = scores.get(item, 0) + similarity
-       return scores
+        if tuning:
+            used_indices = self.data_manager.train_indices
+        else:
+            used_indices = np.concatenate((self.data_manager.train_indices,
+                                           self.data_manager.val_indices))
 
-   def most_recent_sessions(self, sessions, number):
-       tuples = [(session, self.session_time.get(session, -1)) for session in sessions]
-       tuples = sorted(tuples, key=lambda x: x[1], reverse=True)
-       return [element[0] for element in tuples[:number]]
+        train_dataset = SequentialTrainDataset(
+            data_manager=self.data_manager,
+            indices=used_indices,
+            max_size=self.max_size,
+            n_neg=self.n_neg,
+            sample_size=sample_size 
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=pad_collate,
+            num_workers=0
+        )
+        val_indices = self.data_manager.val_indices
+        val_dataset = SequentialTrainDataset(
+            data_manager=self.data_manager,
+            indices=val_indices,
+            max_size=self.max_size,
+            n_neg=self.n_neg,
+            sample_size=None  # 검증은 전체 val 이용
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=pad_collate,
+            num_workers=0
+        )
+        self.optimizer = torch.optim.SGD(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.wd,
+            momentum=self.mom,
+            nesterov=self.nesterov
+        )
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer,
+            step_size=self.step_size,
+            gamma=self.factor
+        )
+        self.to(self.device)
+        self.train()
+
+        best_val_loss = float("inf")
+        best_epoch    = 0
+        wait          = 0  # patience 관리를 위한 카운터
+
+        start_time = time.time()
+        batch_count = 0
+
+        for epoch in range(self.n_epochs):
+            print(f"[PISA] Epoch {epoch+1}/{self.n_epochs}, elapsed={time.time()-start_time:.1f}s")
+
+            # === Training Loop ===
+            total_loss = 0.0
+            self.train()
+            for xx_pad, yy_pad_neg, x_lens in tqdm.tqdm(train_loader):
+                self.optimizer.zero_grad()
+
+                loss = self.compute_loss_batch(xx_pad, yy_pad_neg)
+                loss.backward()
+
+                if self.clip is not None and self.clip > 0:
+                    clip_grad_norm_(self.parameters(), max_norm=self.clip)
+
+                self.optimizer.step()
+                total_loss += loss.item()
+
+                # (선택) step 마다 scheduler 갱신 & 중간 로그
+                if self.step_every is not None and batch_count % self.step_every == 0:
+                    self.scheduler.step()
+                batch_count += 1
+
+            # 한 epoch 끝난 뒤 평균 train_loss
+            avg_train_loss = total_loss / len(train_loader)
+
+            # === Validation Loop ===
+            val_loss = self.evaluate(val_loader)  # 아래 evaluate() 참조
+
+            # 스케줄러는 epoch 단위로도 한 번 step
+            self.scheduler.step()
+
+            # 로그 출력
+            print(f"   >> train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}")
+
+            # === Early Stopping ===
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch    = epoch + 1
+                wait = 0
+                # 모델 저장
+                if savePath:
+                    torch.save(self.state_dict(), savePath)
+            else:
+                wait += 1
+                if wait >= self.patience:
+                    print(f"[PISA] Early stopping triggered at epoch={epoch+1}")
+                    break
+
+        print(f"[PISA] Done training. total_time={time.time()-start_time:.1f}s")
+        print(f"     Best val_loss={best_val_loss:.4f} at epoch={best_epoch}")
+        return
+
+    @torch.no_grad()
+    def evaluate(self, val_loader):
+        self.eval()
+        losses = []
+        for xx_pad, yy_pad_neg, x_lens in val_loader:
+            loss = self.compute_loss_batch(xx_pad, yy_pad_neg)
+            losses.append(loss.item())
+        avg_loss = np.mean(losses)
+        return avg_loss
+
+    def predict_next(self, session_id, input_item_id, all_items):
+        # 1) 임시로 batch_size=1 형태로 tensor 구성
+        x = torch.LongTensor([[input_item_id+1]])
+        x = x.to(self.device)
+
+        # 2) RNN forward
+        sess_repr_all = self.forward(x)  # shape [1, L, D]
+        # L=1이므로 sess_repr = sess_repr_all[:, -1, :] 가능
+        sess_repr = sess_repr_all[:, -1, :]  # [1, D]
+
+        # 3) 아이템 임베딩
+        max_id = min(self.n_items, len(all_items))
+        items_t = torch.LongTensor(all_items[:max_id] + 1).to(self.device)
+        item_embs = self.item_embedding(items_t)  # [n_items, D]
+
+        # 4) 점수=내적
+        scores = torch.matmul(sess_repr, item_embs.transpose(0,1))  # [1, n_items]
+        scores = scores.squeeze(0).detach().cpu().numpy()
+        return scores
+
+def padded_avg(tensor, mask):
+    # tensor이 2D라면 [B, seq_len, 1]로 reshape
+    if tensor.dim() == 2:
+        tensor = tensor.unsqueeze(-1)  # => [B, seq_len, 1]
+
+    mask_f = mask.float()  # [B, seq_len]
+    denom  = torch.sum(mask_f, dim=1, keepdim=True).clamp_min(1e-9)
+    # [B, seq_len, D] × [B, seq_len, 1]
+    masked_tensor = tensor * mask_f.unsqueeze(-1)
+    summed = masked_tensor.sum(dim=1)  # [B, D]
+    avg   = summed / denom
+    return avg

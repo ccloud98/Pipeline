@@ -43,7 +43,7 @@ Then, please unzip all files in a single folder, for instance: `resources/data/r
 Run the following script to pre-process and format the MPD (expected time: around 1 hour on a regular laptop).
 
 ```
-python src/format_rta_input --mpd_path PATH/TO/UNZIPPED/MPD
+python src/format_baseline_input.py --mpd_path resources/data/raw_MPD --out_path resources/data/baseline_input
 ```
 
 

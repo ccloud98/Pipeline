@@ -3,17 +3,18 @@ import pandas as pd
 from evaluator import Evaluator
 from src.data_manager.data_manager import DataManager
 import os
+from datetime import datetime
 
 # 추천 결과 파일 경로 설정
 recos_paths = {
     'MF-Transformer': 'resources/recos/MF-Transformer.npy',
-    # 'NN-Transformer': 'resources/recos/MF-Transformer.npy',
-    # 'FM-Transformer': 'resources/recos/MF-Transformer.npy',
-    # 'MF-GRU': 'resources/recos/MF-GRU.npy',
-    # 'MF-AVG': 'resources/recos/MF-AVG.npy',
+    'NN-Transformer': 'resources/recos/MF-Transformer.npy',
+    'FM-Transformer': 'resources/recos/MF-Transformer.npy',
+    'MF-GRU': 'resources/recos/MF-GRU.npy',
+    'MF-AVG': 'resources/recos/MF-AVG.npy',
     
     'SKNN': 'resources/recos/VSKNN.npy',
-    #  'STAN': 'resources/recos/VSKNN.npy',
+    'STAN': 'resources/recos/VSKNN.npy',
     #  'VSTAN': 'resources/recos/VSKNN.npy',
     #  'VSKNN': 'resources/recos/VSKNN.npy',
 
@@ -68,6 +69,12 @@ print(metrics_df)
 output_folder = 'metrics_results'
 if not os.path.exists(output_folder):
     os.makedirs(output_folder)
-metrics_df.to_csv(os.path.join(output_folder, 'recommendation_metrics_results.csv'))
 
-print("save metrics_results")
+# 현재 시간을 MMDDHHMM 형식으로 포맷팅
+current_time = datetime.now().strftime('%m%d%H%M')
+filename = f'couterpart_results_{current_time}.csv'
+
+full_path = os.path.join(output_folder, filename)
+metrics_df.to_csv(full_path)
+
+print(f"Metrics saved to: {full_path}")
