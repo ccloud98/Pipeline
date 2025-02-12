@@ -35,6 +35,7 @@ class RTAModel(torch.nn.Module):
         top_neg_indices = torch.topk(neg_prods, k=self.training_params['n_hard'], dim=1)[1]
         hard_indices = torch.gather(x_neg, 1, top_neg_indices)
 
+        hard_indices = hard_indices.clamp(0, self.data_manager.n_tracks-1)
         hard_neg_rep = self.representer((hard_indices))
         X_neg_final = torch.cat([easy_neg_rep, hard_neg_rep], dim=1)
         return X_neg_final
@@ -96,9 +97,12 @@ class RTAModel(torch.nn.Module):
             X_rep = self.representer(X)
             X_agg = self.aggregator.aggregate_single(X_rep, torch.zeros((bs, seq_len)).to(dev))
             scores = X_agg.matmul(all_rep[1:-1].T)
-            scores = scores.scatter(1, X.to(dev) - 1, value = - 10**3) # make sure songs in the seed are not recommended
+            X_clamped = X.clamp(1, self.data_manager.n_tracks)
+            scores = scores.scatter(1, X_clamped - 1, value=-1e3)
             coded_recos = torch.topk(scores, k =n_recos, dim=1)[1].cpu().long()
-            recos[current_batch * test_dataloader.batch_size: current_batch * test_dataloader.batch_size + bs] = coded_recos
+            recos_start = current_batch * test_dataloader.batch_size
+            recos_end   = recos_start + bs
+            recos[recos_start:recos_end] = coded_recos
             current_batch+=1
           self.train()
         return recos

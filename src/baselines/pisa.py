@@ -17,7 +17,6 @@ class PISA(nn.Module):
     def __init__(
         self,
         data_manager,
-        k=100,
         n_sample=5000,
         sampling="random",
         embed_dim=128,
@@ -158,7 +157,8 @@ class PISA(nn.Module):
             batch_size=self.batch_size,
             shuffle=True,
             collate_fn=pad_collate,
-            num_workers=0
+            num_workers=0,
+            pin_memory=True
         )
         val_indices = self.data_manager.val_indices
         val_dataset = SequentialTrainDataset(
@@ -173,20 +173,10 @@ class PISA(nn.Module):
             batch_size=self.batch_size,
             shuffle=False,
             collate_fn=pad_collate,
-            num_workers=0
+            num_workers=0,
+            pin_memory=True
         )
-        self.optimizer = torch.optim.SGD(
-            self.parameters(),
-            lr=self.lr,
-            weight_decay=self.wd,
-            momentum=self.mom,
-            nesterov=self.nesterov
-        )
-        self.scheduler = torch.optim.lr_scheduler.StepLR(
-            self.optimizer,
-            step_size=self.step_size,
-            gamma=self.factor
-        )
+        self.optimizer, self.scheduler = self.prepare_optimizer()
         self.to(self.device)
         self.train()
 
@@ -259,6 +249,29 @@ class PISA(nn.Module):
             losses.append(loss.item())
         avg_loss = np.mean(losses)
         return avg_loss
+    
+    def prepare_optimizer(self):
+        """Prepare optimizer and scheduler based on training parameters"""
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.training_params.get("lr", 0.001),
+            weight_decay=self.training_params.get("wd", 1e-5)
+        )
+        
+        if self.training_params.get("use_cosine", False):
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.training_params.get("cosine_tmax", self.n_epochs),
+                eta_min=self.training_params.get("cosine_emin", 1e-6)
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer, 
+                step_size=self.training_params.get("step_size", 3), 
+                gamma=self.training_params.get("gamma", 0.1)
+            )
+            
+        return optimizer, scheduler
 
     def predict_next(self, session_id, input_item_id, all_items):
         # 1) 임시로 batch_size=1 형태로 tensor 구성

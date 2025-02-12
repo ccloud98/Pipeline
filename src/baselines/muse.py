@@ -146,7 +146,8 @@ class MUSE(nn.Module):
             batch_size=self.training_params["batch_size"],
             shuffle=True,
             collate_fn=pad_collate,
-            num_workers=0
+            num_workers=0,
+            pin_memory=True
         )
         return loader
 
@@ -281,6 +282,56 @@ class MUSE(nn.Module):
             if 0 <= gid < self.n_items:
                 final_scores[i] = scores[gid+1]
         return final_scores
+    
+    def compute_recos(self, test_dataloader, n_recos=500):
+        device = self.device
+        n_p = len(test_dataloader.dataset)  # 전체 테스트 샘플(세션) 수
+        recos = np.zeros((n_p, n_recos), dtype=np.int64)
+
+        idx_start = 0  # recos를 채워넣기 위한 index
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch_idx, xx_pad in enumerate(test_dataloader):
+                # pad_collate_eval이 하나의 텐서만 반환한다고 가정
+                # xx_pad shape: [B, seq_len]
+                
+                B = xx_pad.size(0)
+                xx_pad = xx_pad.to(device)
+
+                # (A) x_lens 계산 (padding=0 기준)
+                x_lens = (xx_pad != 0).sum(dim=1)  # shape [B]
+
+                # (B) SRGNN Forward => 세션 임베딩
+                #    "orig_sess" = xx_pad, "lens" = x_lens
+                #    get_last=True => 마지막 hidden state 추출
+                _, batch_repr = self.model(
+                    {"orig_sess": xx_pad, "lens": x_lens},
+                    get_last=True
+                )
+                # batch_repr: [B, hidden_size]
+
+                # (C) 전체 아이템 임베딩
+                item_emb = self.model.backbone.item_embedding.weight  # [n_items+1, hidden_size]
+                logits_batch = torch.matmul(batch_repr, item_emb.T)   # [B, n_items+1]
+
+                # (D) 점수 계산
+                scores_batch = torch.softmax(logits_batch, dim=-1)    # [B, n_items+1]
+
+                # (E) 상위 n_recos 아이템 추출
+                _, top_inds = torch.topk(scores_batch, k=n_recos, dim=1) 
+                # top_inds: [B, n_recos], 아이템 임베딩 인덱스 (1~n_items)
+
+                top_inds = top_inds.cpu().numpy()
+                # MUSE에서 index=0은 PAD, 실제 아이템은 1~n_items이므로 -1 offset
+                top_inds = top_inds - 1  # => [B, n_recos]
+
+                # (F) recos 배열에 저장
+                recos[idx_start : idx_start + B, :] = top_inds
+                idx_start += B
+
+        return recos
+
 
 
 ########################################

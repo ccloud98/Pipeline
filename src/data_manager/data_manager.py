@@ -154,16 +154,17 @@ class DataManager():
         return np.load(f"{self.foldername}/dataset_split/{set_name}_indices.npy")
 
     def get_valid_playlists(self, train_indices, test_indices):
-        train_tracks = set(self.playlist_track[train_indices].indices)
-        test_tracks  = set(self.playlist_track[test_indices].indices)
-        test_size    = len(test_indices)
-        invalid_tracks = test_tracks - train_tracks
-        invalid_positions = set()
-        v = self.playlist_track[test_indices].tocsc()
-        for i in invalid_tracks:
-            invalid_positions = invalid_positions.union(set(v.indices[v.indptr[i]:v.indptr[i+1]]))
-        valid_positions = np.array(sorted([p for p in range(test_size) if p not in invalid_positions]))
-        return test_indices[valid_positions]
+        # cold-start 세팅 시 해당부분 주석
+        # train_tracks = set(self.playlist_track[train_indices].indices)
+        # test_tracks  = set(self.playlist_track[test_indices].indices)
+        # test_size    = len(test_indices)
+        # invalid_tracks = test_tracks - train_tracks
+        # invalid_positions = set()
+        # v = self.playlist_track[test_indices].tocsc()
+        # for i in invalid_tracks:
+        #     invalid_positions = invalid_positions.union(set(v.indices[v.indptr[i]:v.indptr[i+1]]))
+        # valid_positions = np.array(sorted([p for p in range(test_size) if p not in invalid_positions]))
+        return test_indices #[valid_positions]
   
     def get_ground_truth(self, set_name, binary=True, resplit=True, n_start_songs=False):
         if not n_start_songs:
@@ -201,7 +202,7 @@ class DataManager():
         else:
             test_dataset = EvaluationDataset(self, self.val_indices)
 
-        test_dataloader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False, num_workers=0)
+        test_dataloader = DataLoader( test_dataset, batch_size=test_batch_size, shuffle=False, num_workers=0, collate_fn=pad_collate_eval) 
         return test_evaluator, test_dataloader
 
 
@@ -319,11 +320,52 @@ class EvaluationDataset(Dataset):
         return np.array(seed_items)  # shape [n_seed]
 
 
-def pad_collate(batch):
-    seqs, negs = zip(*batch)
-    lens = [len(s) for s in seqs]
+import torch
+from torch.nn.utils.rnn import pad_sequence
 
-    xx_pad = pad_sequence(seqs, batch_first=True, padding_value=0)
-    yy_neg = torch.stack(negs, dim=0)  # [B, n_neg]
-    x_lens = torch.LongTensor(lens)
+def pad_collate(batch):
+    # (1) seqs, negs 각각 분리
+    seqs, negs = zip(*batch)  # seqs=[seq0,seq1,...], negs=[neg0,neg1,...]
+
+    # (2) seqs -> 텐서 변환 + 패딩
+    seqs_t = [torch.tensor(s, dtype=torch.long) for s in seqs]
+    x_lens = torch.LongTensor([len(s) for s in seqs_t])  # 각 시퀀스 길이
+    xx_pad = pad_sequence(seqs_t, batch_first=True, padding_value=0)
+    # xx_pad shape: [B, max_seq_len]
+
+    # (3) negs -> 텐서 변환
+    negs_t = [torch.tensor(n, dtype=torch.long) for n in negs]
+
+    # 만약 negs가 전부 동일 길이라면 아래 한 줄로 OK:
+    # yy_neg = torch.stack(negs_t, dim=0)
+
+    # 만약 negs 길이가 서로 다를 수도 있다면, pad로 처리:
+    neg_lengths = [len(n) for n in negs_t]
+    max_neg_len = max(neg_lengths) if neg_lengths else 0
+
+    padded_negs = []
+    for n_t in negs_t:
+        if len(n_t) < max_neg_len:
+            # 끝에 0으로 패딩
+            pad_size = max_neg_len - len(n_t)
+            # F.pad(tensor, (left, right), value=0) => 1D 텐서 뒤쪽 패딩
+            n_t = F.pad(n_t, (0, pad_size), value=0)
+        padded_negs.append(n_t)
+
+    # 이제 전부 동일 길이이므로 stack 가능
+    yy_neg = torch.stack(padded_negs, dim=0)
+    # yy_neg shape: [B, max_neg_len]
+
     return xx_pad, yy_neg, x_lens
+
+def pad_collate_eval(batch):
+    """
+    batch: list of 1D 시퀀스(길이가 다를 수 있음)
+    Returns: [B, max_len] 형태의 패딩된 텐서
+    """
+    import torch
+    from torch.nn.utils.rnn import pad_sequence
+
+    seqs_t = [torch.tensor(s, dtype=torch.long) for s in batch]
+    xx_pad = pad_sequence(seqs_t, batch_first=True, padding_value=0)
+    return xx_pad  # (B, max_len)

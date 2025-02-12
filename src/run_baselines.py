@@ -1,5 +1,5 @@
 import numpy as np
-from src.data_manager.data_manager import DataManager, SequentialTrainDataset, EvaluationDataset, pad_collate
+from src.data_manager.data_manager import DataManager, SequentialTrainDataset, EvaluationDataset, pad_collate, pad_collate_eval
 from src.utils import array_mapping
 from src.evaluator import Evaluator
 import json, argparse
@@ -76,7 +76,7 @@ if __name__ == "__main__":
                         help="Path to save models", default="resources/recos")
 
     # (A) 샘플링 크기를 직접 지정할 수 있도록 인자 추가 (negative sampling 시 세션 개수 줄이기 등)
-    parser.add_argument("--sample_size", type=int, default=200000,
+    parser.add_argument("--sample_size", type=int, default=None,
                         help="Number of train playlists to sample for training (default=10000)")
 
     parser.add_argument("--extra_task", type=str, required=False, default=None,
@@ -161,7 +161,6 @@ if __name__ == "__main__":
     elif args.model_name == "PISA":
         Model = PISA(
             data_manager=data_manager,
-            k=tr_params["k"],
             n_sample=tr_params["n_sample"],
             sampling=tr_params["sampling"],
             embed_dim=tr_params["embed_dim"],
@@ -228,38 +227,30 @@ if __name__ == "__main__":
     print(f"Training done in {end_fit - start_fit:.2f} seconds.")
 
     # 7) 예측
+    Model.eval()
+    test_dataset = EvaluationDataset(
+        data_manager=data_manager,
+        indices=data_manager.test_indices
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=128,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=pad_collate_eval
+    )
     print("Start predicting", args.model_name, "model")
-    recos_knn = np.zeros((len(last_item), 500), dtype=np.int64)
-
+    
+    # (3) Batch 추론
     if isinstance(Model, nn.DataParallel):
-        predict_fn = Model.module.predict_next
+        recos = Model.module.compute_recos(test_dataloader, n_recos=500)
     else:
-        predict_fn = Model.predict_next
+        recos = Model.compute_recos(test_dataloader, n_recos=500)
 
-    for i, (pid, tid, t) in tqdm.tqdm(
-        enumerate(last_item[["SessionId", "ItemId", "Time"]].values),
-        total=len(last_item)
-    ):
-        pl_tracks = df_train[df_train.SessionId == pid].ItemId.values
-        scores = predict_fn(pid, tid, all_tids)
-
-        if len(scores.shape) != 1:
-            scores = scores.flatten()
-
-        # 예측 결과 중 이미 본 곡, unknown 곡 제외
-        pl_tracks_valid = pl_tracks[pl_tracks < len(scores)]
-        unknown_tracks_valid = [idx for idx in unknown_tracks if idx < len(scores)]
-        scores[pl_tracks_valid] = 0
-        scores[unknown_tracks_valid] = 0
-
-        top_k_scores = np.argsort(-scores)[:500]
-        if len(top_k_scores) < 500:
-            top_k_scores = np.pad(top_k_scores, (0, 500 - len(top_k_scores)), 'constant', constant_values=0)
-
-        recos_knn[i] = top_k_scores
-
+    # (5) 저장
     save_path = f"resources/recos/{args.model_name}.npy"
-    np.save(save_path, recos_knn)
+    np.save(save_path, recos)
     print(f"Predictions saved to {save_path}")
+
 
 
