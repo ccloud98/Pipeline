@@ -37,7 +37,7 @@ class PISA(nn.Module):
             training_params = {}
         self.training_params = training_params
         self.n_epochs   = training_params.get("n_epochs", 30)
-        self.batch_size = training_params.get("batch_size", 16)
+        self.batch_size = training_params.get("batch_size", 128)
         self.lr         = training_params.get("lr", 0.001)
         self.wd         = training_params.get("wd", 1e-5)
         self.mom        = training_params.get("mom", 0.9)
@@ -272,6 +272,54 @@ class PISA(nn.Module):
             )
             
         return optimizer, scheduler
+    
+    def compute_recos(self, test_dataloader, n_recos=500):
+        device = self.device
+        n_p = len(test_dataloader.dataset)  # number of test sessions
+        recos = np.zeros((n_p, n_recos), dtype=np.int64)
+
+        idx_start = 0
+
+        self.eval()
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(test_dataloader):
+                # if batch_data is just (xx_pad,), we do:
+                if isinstance(batch_data, (tuple, list)):
+                    xx_pad = batch_data[0]  # 
+                else:
+                    xx_pad = batch_data  # if direct tensor
+
+                B = xx_pad.size(0)
+                xx_pad = xx_pad.to(device)
+
+                # 1) x_lens
+                x_lens = (xx_pad != 0).sum(dim=1)  # [B]
+
+                # 2) aggregator forward => last hidden
+                output = self.forward(xx_pad)   # [B, L, embed_dim]
+                # last state => gather
+                gather_idx = (x_lens - 1).view(-1,1,1).expand(-1,1,output.size(2))
+                batch_repr = output.gather(1, gather_idx).squeeze(1)  # [B, embed_dim]
+
+                # 3) all item emb => [n_items, embed_dim]
+                item_emb = self.item_embedding.weight  # shape [n_items, embed_dim]
+                # 4) scores => matmul
+                logits = torch.matmul(batch_repr, item_emb.T) # [B, n_items]
+                scores = torch.softmax(logits, dim=-1)        # [B, n_items]
+
+                # 5) topk
+                # index 0 => PAD, real items => 1..n_items-1
+                # but let's just take topk in [0..n_items-1], then shift
+                _, top_inds = torch.topk(scores, k=n_recos, dim=1) # [B, n_recos]
+                top_inds = top_inds.cpu().numpy()
+
+                # shift to real item => top_inds - 1
+                top_inds = top_inds - 1
+
+                recos[idx_start: idx_start + B] = top_inds
+                idx_start += B
+
+        return recos
 
     def predict_next(self, session_id, input_item_id, all_items):
         # 1) 임시로 batch_size=1 형태로 tensor 구성

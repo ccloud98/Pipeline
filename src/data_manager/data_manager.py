@@ -154,16 +154,16 @@ class DataManager():
         return np.load(f"{self.foldername}/dataset_split/{set_name}_indices.npy")
 
     def get_valid_playlists(self, train_indices, test_indices):
-        # cold-start 세팅 시 해당부분 주석
-        # train_tracks = set(self.playlist_track[train_indices].indices)
-        # test_tracks  = set(self.playlist_track[test_indices].indices)
-        # test_size    = len(test_indices)
-        # invalid_tracks = test_tracks - train_tracks
-        # invalid_positions = set()
-        # v = self.playlist_track[test_indices].tocsc()
-        # for i in invalid_tracks:
-        #     invalid_positions = invalid_positions.union(set(v.indices[v.indptr[i]:v.indptr[i+1]]))
-        # valid_positions = np.array(sorted([p for p in range(test_size) if p not in invalid_positions]))
+        #cold-start 세팅 시 해당부분 주석
+        train_tracks = set(self.playlist_track[train_indices].indices)
+        test_tracks  = set(self.playlist_track[test_indices].indices)
+        test_size    = len(test_indices)
+        invalid_tracks = test_tracks - train_tracks
+        invalid_positions = set()
+        v = self.playlist_track[test_indices].tocsc()
+        for i in invalid_tracks:
+            invalid_positions = invalid_positions.union(set(v.indices[v.indptr[i]:v.indptr[i+1]]))
+        valid_positions = np.array(sorted([p for p in range(test_size) if p not in invalid_positions]))
         return test_indices #[valid_positions]
   
     def get_ground_truth(self, set_name, binary=True, resplit=True, n_start_songs=False):

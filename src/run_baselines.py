@@ -176,12 +176,15 @@ if __name__ == "__main__":
         Model = LARP(
             data_manager=data_manager,
             n_sample=tr_params["n_sample"],
-            embed_dim=tr_params["embed_dim"],
-            fusion_method=tr_params["fusion_method"],
-            ablation_loss=tr_params["ablation_loss"],
-            queue_size=tr_params["queue_size"],
-            momentum=tr_params["momentum"],
-            training_params=tr_params["training_params"]
+            k=tr_params["k"],                          # 1500
+            hidden_size=tr_params["hidden_size"],       # 768
+            n_layers=tr_params["n_layers"],             # 12
+            num_heads=tr_params["num_heads"],           # 12
+            intermediate_size=tr_params["intermediate_size"],  # 3072
+            method=tr_params["method"],                 # "average"
+            queue_size=tr_params["queue_size"],         # 57600
+            momentum=tr_params["momentum"],             # 0.995
+            training_params=tr_params["training_params"] 
         )
     else:
         raise ValueError(f"Unknown model name: {args.model_name}")

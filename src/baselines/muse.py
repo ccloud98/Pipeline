@@ -13,7 +13,7 @@ from typing import Tuple
 
 class MUSE(nn.Module):
     def __init__(self, data_manager,
-                 k=1500, n_items=2262292, hidden_size=128, lr=0.01, batch_size=64,
+                 k=1500, n_items=2262292, hidden_size=128, lr=0.01, batch_size=128,
                  alpha=0.5, inv_coeff=1.0, var_coeff=0.5, cov_coeff=0.25,
                  n_layers=2, maxlen=10, dropout=0.1, embedding_dim=256,
                  n_sample=10000, step=1, training_params=None):
