@@ -105,39 +105,7 @@ if __name__ == "__main__":
     savePath = f"{args.models_path}/{args.model_name}"
 
     # 3) 모델 생성
-    if args.model_name == "VSKNN":
-        Model = VMContextKNN(
-            k=tr_params["k"],
-            sample_size=tr_params["n_sample"],
-            weighting=tr_params["w"],
-            weighting_score=tr_params["w_score"],
-            idf_weighting=tr_params["idf_w"]
-        )
-    elif args.model_name == "SKNN":
-        Model = ContextKNN(
-            k=tr_params["k"],
-            sample_size=tr_params["n_sample"],
-            similarity=tr_params["s"]
-        )
-    elif args.model_name == "VSTAN":
-        # time 보정
-        df_train["Time"] = df_train["Time"] / 1000
-        Model = VSKNN_STAN(
-            k=tr_params["k"],
-            sample_size=tr_params["n_sample"],
-            lambda_spw=tr_params["sp_w"],
-            lambda_snh=tr_params["sn_w"],
-            lambda_inh=tr_params["in_w"]
-        )
-    elif args.model_name == "STAN":
-        Model = STAN(
-            k=tr_params["k"],
-            sample_size=tr_params["n_sample"],
-            lambda_spw=tr_params["sp_w"],
-            lambda_snh=tr_params["sn_w"],
-            lambda_inh=tr_params["in_w"]
-        )
-    elif args.model_name == "MUSE":
+    if args.model_name == "MUSE":
         # 수정된 MUSE (negative sampling + multi-target)
         # => MUSE 내부에 'compute_loss_batch(x_pos, x_neg)' 등 구현
         Model = MUSE(
